@@ -1,6 +1,6 @@
 """
 daak — Hub Coverage Planner
-Step 2: Connect to Postgres, show database stats.
+Step 3: District selector + per-district stats.
 """
 
 import streamlit as st
@@ -13,66 +13,105 @@ st.set_page_config(
 )
 
 st.title("🚚 daak")
-st.caption("Hub Coverage Planner — Step 2: Database connected")
+st.caption("Hub Coverage Planner")
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Data access (cached for performance)
 # ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300)
+def get_states() -> list[str]:
+    """States available in the hierarchy table."""
+    rows = fetch_all("""
+        SELECT DISTINCT state
+        FROM geographic_hierarchy
+        WHERE state IS NOT NULL AND state != ''
+        ORDER BY state
+    """)
+    return [r["state"] for r in rows]
+
+
+@st.cache_data(ttl=300)
+def get_districts(state: str) -> list[str]:
+    rows = fetch_all("""
+        SELECT DISTINCT district
+        FROM geographic_hierarchy
+        WHERE state = %s AND district IS NOT NULL AND district != ''
+        ORDER BY district
+    """, (state,))
+    return [r["district"] for r in rows]
+
 
 @st.cache_data(ttl=60)
-def get_db_summary() -> dict:
-    """Top-line counts to verify the data layer is wired up."""
+def get_district_stats(state: str, district: str) -> dict:
+    """Counts for a given district."""
     rows = fetch_all("""
         SELECT
-            (SELECT COUNT(*) FROM pincodes_master)                  AS total_pincodes,
-            (SELECT COUNT(*) FROM pincodes_master WHERE has_polygon) AS pincodes_with_polygon,
-            (SELECT COUNT(DISTINCT district) FROM pincodes_master)  AS total_districts_in_pincodes,
-            (SELECT COUNT(DISTINCT state)    FROM pincodes_master)  AS total_states_in_pincodes,
-            (SELECT COUNT(*) FROM geographic_hierarchy)             AS total_villages,
-            (SELECT COUNT(DISTINCT district) FROM geographic_hierarchy) AS total_districts_in_hierarchy,
-            (SELECT COUNT(DISTINCT state)    FROM geographic_hierarchy) AS total_states_in_hierarchy
-    """)
+            (SELECT COUNT(*) FROM pincodes_master
+             WHERE LOWER(district) = LOWER(%s)) AS pincodes,
+            (SELECT COUNT(*) FROM pincodes_master
+             WHERE LOWER(district) = LOWER(%s) AND has_polygon) AS pincodes_with_polygon,
+            (SELECT COUNT(DISTINCT sub_district) FROM geographic_hierarchy
+             WHERE state = %s AND district = %s) AS sub_districts,
+            (SELECT COUNT(*) FROM geographic_hierarchy
+             WHERE state = %s AND district = %s) AS villages
+    """, (district, district, state, district, state, district))
     return rows[0]
 
 
-@st.cache_data(ttl=60)
-def get_pincodes_per_state() -> list:
-    return fetch_all("""
-        SELECT state, COUNT(*) AS pincodes
-        FROM pincodes_master
-        WHERE state IS NOT NULL AND state != ''
-        GROUP BY state
-        ORDER BY pincodes DESC
-        LIMIT 15
-    """)
+# ---------------------------------------------------------------------------
+# Sidebar — area selection
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("Area")
+
+    states = get_states()
+    state = st.selectbox(
+        "State",
+        options=[""] + states,
+        format_func=lambda x: "— Choose state —" if x == "" else x,
+    )
+
+    if state:
+        districts = get_districts(state)
+        district = st.selectbox(
+            "District",
+            options=[""] + districts,
+            format_func=lambda x: "— Choose district —" if x == "" else x,
+        )
+    else:
+        district = ""
+        st.selectbox("District", options=["— Pick a state first —"], disabled=True)
 
 
 # ---------------------------------------------------------------------------
-# Render
+# Main content
 # ---------------------------------------------------------------------------
 
-try:
-    summary = get_db_summary()
-    st.success("✅ Database connected")
+if not state:
+    st.info("👈 Pick a state to begin.")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Pincodes", f"{summary['total_pincodes']:,}")
-    col2.metric("With polygon", f"{summary['pincodes_with_polygon']:,}")
-    col3.metric("Villages", f"{summary['total_villages']:,}")
-    col4.metric("States (hierarchy)", summary['total_states_in_hierarchy'])
+elif not district:
+    st.info(f"👈 Now pick a district in **{state}**.")
+
+else:
+    stats = get_district_stats(state, district)
+
+    st.subheader(f"{district}, {state}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pincodes", f"{stats['pincodes']:,}")
+    c2.metric("With polygon", f"{stats['pincodes_with_polygon']:,}")
+    c3.metric("Sub-districts", f"{stats['sub_districts']:,}")
+    c4.metric("Villages", f"{stats['villages']:,}")
+
+    if stats["pincodes"] == 0:
+        st.warning(
+            f"No pincodes found for '{district}'. "
+            "This might be a name mismatch — district exists in hierarchy but not in pincodes_master."
+        )
 
     st.divider()
-
-    st.subheader("Pincodes per state (top 15)")
-    rows = get_pincodes_per_state()
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-except Exception as e:
-    st.error(f"❌ Database connection failed: {e}")
-    st.code(
-        "Check that:\n"
-        "1. Docker container 'daak-pg' is running (`docker ps`)\n"
-        "2. .env file exists in frontend/ with DATABASE_URL\n"
-        "3. Schema and data have been loaded"
-    )
+    st.caption("Next step: place virtual hubs and compute coverage.")
