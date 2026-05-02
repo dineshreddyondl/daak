@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files (never commit secrets)
+.env
+.env.local
+*.env
+
+# Data files (too big for git, source-of-truth lives elsewhere)
+data/
+*.json.gz
+*.xlsx
+!**/example*.xlsx
+!.env.example
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
