@@ -66,7 +66,7 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
   const [pincodes, setPincodes] = useState([])
   const [hubs, setHubs] = useState([])
 
-  const [mode, setMode] = useState('search')
+  const [mode, setMode] = useState('area')
   const [hubName, setHubName] = useState('')
   const [hubLat, setHubLat] = useState('')
   const [hubLng, setHubLng] = useState('')
@@ -538,8 +538,8 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
             <>
               <h2>3. Position the Hub</h2>
               <div className="mode-toggle">
-                <button className={mode === 'search' ? 'active' : ''} onClick={() => setMode('search')}>🔍 Search</button>
-                <button className={mode === 'area' ? 'active' : ''} onClick={() => setMode('area')}>📍 Pick by area</button>
+                <button className={mode === 'area' ? 'active' : ''} onClick={() => setMode('area')}>📍 Choose Manually (Sub-district)</button>
+                <button className={mode === 'search' ? 'active' : ''} onClick={() => setMode('search')}>🔍 Use Google Maps</button>
               </div>
 
               {mode === 'search' ? (
@@ -565,7 +565,7 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
                 </>
               )}
 
-              <h2>4. Hub Details</h2>
+              <h2>4. Virtual Hub Details</h2>
               <label>Hub Name</label>
               <input type="text" value={hubName} onChange={e => setHubName(e.target.value)}
                      placeholder="e.g., Center Hub" />
@@ -952,8 +952,8 @@ export default function App() {
     <div className="app">
       <header>
         <div className="brand">
-          <h1>🚚 daak</h1>
-          <span className="badge">v0.3</span>
+          <h1>🚚 DAAK</h1>
+          <span className="badge">Beta</span>
         </div>
         <div className="tabs">
           <div className={`tab ${activeTab === 'builder' ? 'active' : ''}`}
