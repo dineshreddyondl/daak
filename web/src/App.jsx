@@ -2,8 +2,12 @@ import React, { useEffect, useRef, useState } from 'react'
 
 const HUB_COLORS = ['#dc2626', '#9333ea', '#0891b2', '#ca8a04', '#15803d', '#be185d']
 
+// In production, frontend talks to API at VITE_API_URL.
+// In dev, the empty string lets Vite's proxy forward /api to localhost:8000.
+const API_BASE = import.meta.env.VITE_API_URL || ''
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   })
@@ -704,13 +708,13 @@ function ServiceabilityView({ jumpToBuilder }) {
   }
 
   function downloadDistrict(district) {
-    window.location.href = `/api/export/district?district=${encodeURIComponent(district)}`
+    window.location.href = `${API_BASE}/api/export/district?district=${encodeURIComponent(district)}`
   }
   function downloadDrafts() {
-    window.location.href = '/api/export/drafts'
+    window.location.href = `${API_BASE}/api/export/drafts`
   }
   function downloadFinalized() {
-    window.location.href = '/api/export/finalized'
+    window.location.href = `${API_BASE}/api/export/finalized`
   }
 
   // Top-level metrics

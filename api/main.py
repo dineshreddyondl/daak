@@ -33,7 +33,7 @@ import openpyxl
 def get_database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
-        raise RuntimeError("DATABASE_URL is not set. Create a .env file.")
+        raise RuntimeError("DATABASE_URL is not set")
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     return url
@@ -80,9 +80,14 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 app = FastAPI(title="daak API", version="0.3.0")
 
+# CORS — read allowed origins from env (comma-separated), with sensible defaults
+_default_origins = "http://localhost:5173,http://localhost:3000"
+_allowed_origins = os.environ.get("CORS_ORIGINS", _default_origins)
+allowed_origins = [o.strip() for o in _allowed_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,10 +122,6 @@ def health():
     except Exception as e:
         raise HTTPException(503, f"DB unhealthy: {e}")
 
-
-# ---------------------------------------------------------------------------
-# Read endpoints (Builder)
-# ---------------------------------------------------------------------------
 
 @app.get("/api/states")
 def list_states():
@@ -321,10 +322,8 @@ def delete_hub(hub_id: int):
 def toggle_coverage(coverage_id: int, body: ToggleIn):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT c.district FROM district_coverage c
-                WHERE c.id = %s
-            """, (coverage_id,))
+            cur.execute("SELECT c.district FROM district_coverage c WHERE c.id = %s",
+                        (coverage_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "Coverage row not found")
@@ -375,18 +374,10 @@ def finalize_district(state: str, district: str, body: FinalizeIn):
     return {"district": district, "status": "FINALIZED"}
 
 
-# ---------------------------------------------------------------------------
-# Serviceability — list / detail / aggregate
-# ---------------------------------------------------------------------------
-
 @app.get("/api/serviceability/overview")
 def serviceability_overview(state: Optional[str] = None,
                             status: Optional[str] = None,
                             search: Optional[str] = None):
-    """List of all districts that have at least 1 hub, with summary counts.
-
-    Filters: state, status (DRAFT/FINALIZED), search (substring of district name).
-    """
     where_clauses = ["EXISTS (SELECT 1 FROM district_hubs h WHERE h.district = ds.district)"]
     params: list = []
 
@@ -424,7 +415,6 @@ def serviceability_overview(state: Optional[str] = None,
 
 @app.get("/api/serviceability/summary")
 def serviceability_summary():
-    """Top-line counts across all districts with at least 1 hub."""
     row = fetch_one("""
         SELECT
             (SELECT COUNT(*) FROM district_status ds
@@ -446,7 +436,6 @@ def serviceability_summary():
 
 @app.get("/api/serviceability/district")
 def serviceability_district(state: str = Query(...), district: str = Query(...)):
-    """Read-only detail for a saved district: hubs + per-pincode coverage."""
     status_row = fetch_one("SELECT * FROM district_status WHERE district = %s",
                            (district,))
     if not status_row:
@@ -468,11 +457,7 @@ def serviceability_district(state: str = Query(...), district: str = Query(...))
         ORDER BY c.pincode, c.distance_km
     """, (state, district))
 
-    return {
-        "status": status_row,
-        "hubs": hubs,
-        "coverage": coverage,
-    }
+    return {"status": status_row, "hubs": hubs, "coverage": coverage}
 
 
 @app.get("/api/districts/finalized")
@@ -488,28 +473,15 @@ def list_finalized_districts():
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Excel export — multi-tab
-# ---------------------------------------------------------------------------
-
 def _safe_sheet_name(name: str) -> str:
-    """Excel sheet names must be <=31 chars, no special chars."""
     bad = set(r'[]:*?/\\')
     cleaned = "".join("_" if c in bad else c for c in name)
     return cleaned[:31] or "Sheet"
 
 
 def _build_multi_tab_excel(districts: list[dict]) -> bytes:
-    """One tab per district + an Overview tab at the front.
-
-    Each `district` dict must have:
-      - district, state, status, hub_count, active_pincodes
-      - hubs: list of dicts
-      - coverage: list of dicts
-    """
     wb = openpyxl.Workbook()
 
-    # Overview tab
     ws = wb.active
     ws.title = "Overview"
     ws.append(["State", "District", "Status", "Hubs", "Active Pincodes",
@@ -525,7 +497,6 @@ def _build_multi_tab_excel(districts: list[dict]) -> bytes:
 
     used_names: set[str] = set()
     for d in districts:
-        # Ensure unique sheet names
         base = _safe_sheet_name(d["district"])
         name = base
         i = 2
@@ -536,16 +507,12 @@ def _build_multi_tab_excel(districts: list[dict]) -> bytes:
         used_names.add(name)
 
         sheet = wb.create_sheet(title=name)
-
-        # Header rows summarizing the district
         sheet.append([f"{d['district']}, {d['state']}"])
         sheet.append([f"Status: {d['status']} · "
                       f"{d['hub_count']} hubs · "
                       f"{d.get('active_pincodes', 0)} active pincodes · "
                       f"{d.get('excluded_pincodes', 0)} excluded"])
         sheet.append([])
-
-        # Hubs section
         sheet.append(["Hubs"])
         sheet.append(["Hub Name", "Lat", "Lng", "Radius (km)", "Created At"])
         for h in d.get("hubs", []):
@@ -554,8 +521,6 @@ def _build_multi_tab_excel(districts: list[dict]) -> bytes:
                 h["created_at"].strftime("%Y-%m-%d %H:%M") if h.get("created_at") else "",
             ])
         sheet.append([])
-
-        # Coverage section
         sheet.append(["Pincode Coverage"])
         sheet.append(["Pincode", "City", "Hub", "Distance (km)", "Status",
                       "Exclusion Reason"])
@@ -574,7 +539,6 @@ def _build_multi_tab_excel(districts: list[dict]) -> bytes:
 
 
 def _gather_districts_for_export(filter_status: Optional[str]) -> list[dict]:
-    """Return enriched district list with hubs + coverage embedded."""
     where = ""
     params: list = []
     if filter_status:
@@ -599,10 +563,8 @@ def _gather_districts_for_export(filter_status: Optional[str]) -> list[dict]:
         ORDER BY ds.state, ds.district
     """, tuple(params))
 
-    # Skip districts with zero hubs
     base_rows = [r for r in base_rows if r["hub_count"] > 0]
 
-    # For each district, hydrate hubs + coverage
     for d in base_rows:
         d["hubs"] = fetch_all("""
             SELECT id, hub_name, hub_lat, hub_lng, radius_km, created_at
@@ -624,24 +586,21 @@ def _gather_districts_for_export(filter_status: Optional[str]) -> list[dict]:
 
 @app.get("/api/export/district")
 def export_district(district: str = Query(...)):
-    """Single-district Excel — same multi-section format as multi-tab, but one sheet."""
     rows = _gather_districts_for_export(filter_status=None)
     rows = [r for r in rows if r["district"].lower() == district.lower()]
     if not rows:
         raise HTTPException(404, "No data for this district")
     data = _build_multi_tab_excel(rows)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"daak_{district}_{ts}.xlsx"
     return StreamingResponse(
         io.BytesIO(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="daak_{district}_{ts}.xlsx"'},
     )
 
 
 @app.get("/api/export/drafts")
 def export_drafts():
-    """One tab per DRAFT district."""
     rows = _gather_districts_for_export(filter_status="DRAFT")
     if not rows:
         raise HTTPException(404, "No DRAFT districts to export")
@@ -656,7 +615,6 @@ def export_drafts():
 
 @app.get("/api/export/finalized")
 def export_finalized():
-    """One tab per FINALIZED district."""
     rows = _gather_districts_for_export(filter_status="FINALIZED")
     if not rows:
         raise HTTPException(404, "No FINALIZED districts to export")
@@ -669,7 +627,6 @@ def export_finalized():
     )
 
 
-# Backwards compat — old clients calling /api/export/all get FINALIZED
 @app.get("/api/export/all")
 def export_all_districts_legacy():
     return export_finalized()
@@ -677,4 +634,5 @@ def export_all_districts_legacy():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
