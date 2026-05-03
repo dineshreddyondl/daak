@@ -14,8 +14,10 @@ export default defineConfig({
   },
   preview: {
     port: 5173,
-    // Allow any *.up.railway.app host so deploys don't break when the
-    // domain changes. You can tighten this to a specific host later.
-    allowedHosts: ['.up.railway.app'],
+    // Allow any host so production deploys work behind any domain
+    // (Railway-generated, custom Cloudflare-fronted, etc.)
+    // For an internal tool this is acceptable; for a public app you'd
+    // restrict to a specific list.
+    allowedHosts: true,
   },
 })
