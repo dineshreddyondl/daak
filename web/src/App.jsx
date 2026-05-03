@@ -1,0 +1,978 @@
+import React, { useEffect, useRef, useState } from 'react'
+
+const HUB_COLORS = ['#dc2626', '#9333ea', '#0891b2', '#ca8a04', '#15803d', '#be185d']
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`${res.status}: ${text}`)
+  }
+  if (res.headers.get('content-type')?.includes('application/json')) {
+    return res.json()
+  }
+  return res
+}
+
+function computeBounds(pincodes) {
+  if (!pincodes.length) return null
+  let minLat = Infinity, maxLat = -Infinity
+  let minLng = Infinity, maxLng = -Infinity
+  for (const p of pincodes) {
+    if (p.centroid_lat == null || p.centroid_lng == null) continue
+    if (p.centroid_lat < minLat) minLat = p.centroid_lat
+    if (p.centroid_lat > maxLat) maxLat = p.centroid_lat
+    if (p.centroid_lng < minLng) minLng = p.centroid_lng
+    if (p.centroid_lng > maxLng) maxLng = p.centroid_lng
+  }
+  if (!isFinite(minLat)) return null
+  return { sw: { lat: minLat, lng: minLng }, ne: { lat: maxLat, lng: maxLng } }
+}
+
+function formatTimeAgo(iso) {
+  if (!iso) return ''
+  const t = new Date(iso).getTime()
+  const diff = (Date.now() - t) / 1000
+  if (diff < 60) return 'just now'
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  return `${Math.floor(diff / 86400)}d ago`
+}
+
+
+// ============================================================================
+// BUILDER VIEW
+// ============================================================================
+
+function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
+  const [states, setStates] = useState([])
+  const [districts, setDistricts] = useState([])
+  const [subDistricts, setSubDistricts] = useState([])
+  const [villages, setVillages] = useState([])
+
+  const [state, setState] = useState('')
+  const [district, setDistrict] = useState('')
+  const [subDistrict, setSubDistrict] = useState('')
+  const [village, setVillage] = useState('')
+
+  const [stats, setStats] = useState(null)
+  const [pincodes, setPincodes] = useState([])
+  const [hubs, setHubs] = useState([])
+
+  const [mode, setMode] = useState('search')
+  const [hubName, setHubName] = useState('')
+  const [hubLat, setHubLat] = useState('')
+  const [hubLng, setHubLng] = useState('')
+  const [radius, setRadius] = useState(25)
+  const [status, setStatus] = useState('Pick a district to begin')
+  const [statusType, setStatusType] = useState('')
+  const [zoomLevel, setZoomLevel] = useState(5)
+  const [draftSaved, setDraftSaved] = useState(false)
+
+  const mapRef = useRef(null)
+  const mapInstance = useRef(null)
+  const polygonLayers = useRef([])
+  const labelLayers = useRef([])
+  const hubLayers = useRef({})
+  const pendingMarker = useRef(null)
+  const previewCircle = useRef(null)
+  const autocompleteRef = useRef(null)
+  const searchInputRef = useRef(null)
+  const districtBoundsRef = useRef(null)
+
+  // Pre-select if Serviceability passed us a state/district
+  useEffect(() => {
+    if (prefilled?.state) setState(prefilled.state)
+    if (prefilled?.district) setDistrict(prefilled.district)
+    if (prefilled) onPrefilledHandled?.()
+  }, [prefilled])
+
+  useEffect(() => {
+    api('/api/states').then(setStates).catch(e => setStatusErr(e.message))
+  }, [])
+
+  useEffect(() => {
+    if (!state) { setDistricts([]); return }
+    api(`/api/districts?state=${encodeURIComponent(state)}`)
+      .then(setDistricts).catch(e => setStatusErr(e.message))
+  }, [state])
+
+  useEffect(() => {
+    if (!state || !district) {
+      setStats(null); setPincodes([]); setHubs([])
+      districtBoundsRef.current = null
+      return
+    }
+    Promise.all([
+      api(`/api/district/stats?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`),
+      api(`/api/district/pincodes?district=${encodeURIComponent(district)}`),
+      api(`/api/district/hubs?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`),
+    ]).then(([s, pc, h]) => {
+      setStats(s)
+      setPincodes(pc)
+      setHubs(h.map(hub => ({
+        id: hub.id, name: hub.hub_name,
+        lat: hub.hub_lat, lng: hub.hub_lng,
+        radius_km: hub.radius_km,
+        pincodes: hub.pincodes || [],
+      })))
+      districtBoundsRef.current = computeBounds(pc)
+      setStatusOk(`Loaded ${pc.length} pincodes for ${district}.`)
+      fitMapToBounds(pc)
+    }).catch(e => setStatusErr(e.message))
+  }, [state, district])
+
+  useEffect(() => {
+    if (!state || !district) { setSubDistricts([]); return }
+    api(`/api/sub_districts?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`)
+      .then(setSubDistricts).catch(e => setStatusErr(e.message))
+  }, [state, district])
+
+  useEffect(() => {
+    if (!state || !district || !subDistrict) { setVillages([]); return }
+    api(`/api/villages?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}&sub_district=${encodeURIComponent(subDistrict)}`)
+      .then(setVillages).catch(e => setStatusErr(e.message))
+  }, [state, district, subDistrict])
+
+  useEffect(() => {
+    if (mapInstance.current) return
+    mapInstance.current = new window.google.maps.Map(mapRef.current, {
+      center: { lat: 20.5, lng: 78.9 }, zoom: 5,
+      mapTypeControl: true, streetViewControl: false, fullscreenControl: true,
+    })
+    mapInstance.current.addListener('click', e => {
+      if (!district) {
+        setStatusErr('Select a district first')
+        return
+      }
+      fillFromCoords(e.latLng.lat(), e.latLng.lng())
+    })
+    mapInstance.current.addListener('zoom_changed', () => {
+      setZoomLevel(mapInstance.current.getZoom())
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!window.google?.maps?.places || !searchInputRef.current || mode !== 'search') return
+
+    if (autocompleteRef.current) {
+      window.google.maps.event.clearInstanceListeners(autocompleteRef.current)
+      autocompleteRef.current = null
+    }
+
+    const options = {
+      fields: ['geometry', 'name', 'formatted_address'],
+      componentRestrictions: { country: 'in' },
+    }
+    const bb = districtBoundsRef.current
+    if (bb) {
+      const bounds = new window.google.maps.LatLngBounds(
+        { lat: bb.sw.lat, lng: bb.sw.lng },
+        { lat: bb.ne.lat, lng: bb.ne.lng },
+      )
+      options.bounds = bounds
+      options.strictBounds = true
+    }
+
+    const ac = new window.google.maps.places.Autocomplete(searchInputRef.current, options)
+    ac.addListener('place_changed', () => {
+      const place = ac.getPlace()
+      if (!place || !place.geometry) {
+        setStatusErr(bb
+          ? `No location matching "${searchInputRef.current.value}" in ${district}.`
+          : 'No location found.')
+        return
+      }
+      const loc = place.geometry.location
+      fillFromCoords(loc.lat(), loc.lng(), place.name || place.formatted_address)
+      mapInstance.current.panTo(loc)
+      mapInstance.current.setZoom(14)
+    })
+
+    autocompleteRef.current = ac
+  }, [district, mode, pincodes])
+
+  function getCoverageMap() {
+    const m = new Map()
+    hubs.forEach(h => {
+      h.pincodes.forEach(p => {
+        if (!m.has(p.pincode)) {
+          m.set(p.pincode, {
+            id: p.id, is_excluded: p.is_excluded,
+            hub_id: h.id, distance_km: p.distance_km,
+          })
+        }
+      })
+    })
+    return m
+  }
+
+  async function toggleExclude(pincode) {
+    const covMap = getCoverageMap()
+    const cov = covMap.get(pincode)
+    if (!cov) return
+    const newExcluded = !cov.is_excluded
+    try {
+      await api(`/api/coverage/${cov.id}/toggle`, {
+        method: 'POST',
+        body: JSON.stringify({ is_excluded: newExcluded }),
+      })
+      setHubs(prev => prev.map(h => ({
+        ...h,
+        pincodes: h.pincodes.map(p =>
+          p.pincode === pincode ? { ...p, is_excluded: newExcluded } : p
+        ),
+      })))
+      setStatusOk(newExcluded ? `Excluded ${pincode}` : `Re-included ${pincode}`)
+    } catch (e) {
+      setStatusErr(`Toggle failed: ${e.message}`)
+    }
+  }
+
+  useEffect(() => {
+    if (!mapInstance.current) return
+
+    polygonLayers.current.forEach(l => l.setMap(null))
+    polygonLayers.current = []
+    labelLayers.current.forEach(l => l.setMap(null))
+    labelLayers.current = []
+
+    const covMap = getCoverageMap()
+
+    if (district) {
+      pincodes.forEach(p => {
+        const cov = covMap.get(p.pincode)
+        const isCovered = cov && !cov.is_excluded
+        const isExcluded = cov && cov.is_excluded
+
+        let strokeColor, fillColor, fillOpacity, strokeOpacity, weight = 1
+        if (isCovered) {
+          strokeColor = '#1e40af'; fillColor = '#10b981'; fillOpacity = 0.35; strokeOpacity = 0.9
+        } else if (isExcluded) {
+          strokeColor = '#dc2626'; fillColor = '#9ca3af'; fillOpacity = 0.35; strokeOpacity = 0.9; weight = 2
+        } else {
+          strokeColor = '#1e40af'; fillColor = '#3b82f6'; fillOpacity = 0.15; strokeOpacity = 0.9
+        }
+
+        const boundary = p.boundary_geojson
+        if (boundary && boundary.type === 'Polygon') {
+          const paths = boundary.coordinates[0].map(([lng, lat]) => ({ lat, lng }))
+          const poly = new window.google.maps.Polygon({
+            paths, strokeColor, strokeWeight: weight, strokeOpacity, fillColor, fillOpacity,
+            map: mapInstance.current, clickable: !!cov,
+          })
+          if (cov) {
+            poly.addListener('click', e => {
+              const buttonText = isExcluded ? 'Re-include in coverage' : 'Exclude from coverage'
+              const buttonColor = isExcluded ? '#059669' : '#dc2626'
+              const stateLabel = isExcluded
+                ? `<span style="color:#dc2626;font-weight:700;">EXCLUDED</span>`
+                : `<span style="color:#059669;font-weight:700;">COVERED</span>`
+              const html = `
+                <div style="font-family:inherit;padding:4px;">
+                  <div style="font-size:14px;font-weight:700;">${p.pincode}</div>
+                  <div style="color:#6b7280;font-size:12px;">${p.city || '—'}</div>
+                  <div style="font-size:11px;margin:6px 0;">
+                    ${cov.distance_km} km from hub • ${stateLabel}
+                  </div>
+                  <button id="toggle-${p.pincode}" style="
+                    padding:6px 10px;background:${buttonColor};color:white;
+                    border:none;border-radius:4px;cursor:pointer;font-size:12px;
+                    font-weight:600;width:100%;">${buttonText}</button>
+                </div>
+              `
+              const info = new window.google.maps.InfoWindow({ content: html })
+              info.setPosition(e.latLng)
+              info.open(mapInstance.current)
+              window.google.maps.event.addListenerOnce(info, 'domready', () => {
+                const btn = document.getElementById(`toggle-${p.pincode}`)
+                if (btn) {
+                  btn.onclick = () => { info.close(); toggleExclude(p.pincode) }
+                }
+              })
+            })
+          }
+          polygonLayers.current.push(poly)
+        } else if (p.centroid_lat && p.centroid_lng) {
+          const dotColor = isCovered ? '#10b981' : isExcluded ? '#9ca3af' : '#3b82f6'
+          const m = new window.google.maps.Marker({
+            position: { lat: p.centroid_lat, lng: p.centroid_lng },
+            map: mapInstance.current,
+            icon: {
+              path: window.google.maps.SymbolPath.CIRCLE, scale: 5,
+              fillColor: dotColor, fillOpacity: 0.7,
+              strokeColor: '#1e40af', strokeWeight: 1,
+            },
+            title: `${p.pincode} ${p.city || ''}${cov ? (isExcluded ? ' (excluded)' : ' (covered)') : ''}`,
+            clickable: !!cov,
+          })
+          if (cov) m.addListener('click', () => toggleExclude(p.pincode))
+          polygonLayers.current.push(m)
+        }
+
+        if (cov && p.centroid_lat && p.centroid_lng) {
+          const labelColor = isExcluded ? '#dc2626' : '#064e3b'
+          const labelText = isExcluded ? `${p.pincode} ✗` : String(p.pincode)
+          const label = new window.google.maps.Marker({
+            position: { lat: p.centroid_lat, lng: p.centroid_lng },
+            map: mapInstance.current,
+            icon: { path: 'M 0,0 0,0', strokeOpacity: 0, fillOpacity: 0, scale: 1 },
+            label: { text: labelText, color: labelColor, fontSize: '11px', fontWeight: '700' },
+            clickable: false, zIndex: 1000,
+          })
+          labelLayers.current.push(label)
+        }
+      })
+    }
+  }, [pincodes, hubs, district])
+
+  useEffect(() => {
+    if (!labelLayers.current.length) return
+    const visible = zoomLevel >= 11
+    labelLayers.current.forEach(l => l.setVisible(visible))
+  }, [zoomLevel])
+
+  useEffect(() => {
+    if (!mapInstance.current) return
+    Object.values(hubLayers.current).forEach(l => {
+      l.marker.setMap(null); l.circle.setMap(null)
+    })
+    hubLayers.current = {}
+    hubs.forEach((h, i) => {
+      const color = HUB_COLORS[i % HUB_COLORS.length]
+      const marker = new window.google.maps.Marker({
+        position: { lat: h.lat, lng: h.lng }, map: mapInstance.current,
+        label: { text: String(i + 1), color: 'white', fontSize: '12px', fontWeight: '700' },
+        title: `${h.name} (${h.pincodes.length} pincodes)`, zIndex: 2000,
+      })
+      const circle = new window.google.maps.Circle({
+        strokeColor: color, strokeWeight: 2,
+        fillColor: color, fillOpacity: 0.1,
+        map: mapInstance.current,
+        center: { lat: h.lat, lng: h.lng }, radius: h.radius_km * 1000, clickable: false,
+      })
+      hubLayers.current[h.id] = { marker, circle }
+    })
+  }, [hubs])
+
+  useEffect(() => {
+    if (!mapInstance.current) return
+    if (previewCircle.current) { previewCircle.current.setMap(null); previewCircle.current = null }
+    const lat = parseFloat(hubLat), lng = parseFloat(hubLng), r = parseFloat(radius)
+    if (!isNaN(lat) && !isNaN(lng) && !isNaN(r) && r > 0) {
+      previewCircle.current = new window.google.maps.Circle({
+        strokeColor: '#dc2626', strokeWeight: 2, strokeOpacity: 0.9,
+        fillColor: '#dc2626', fillOpacity: 0.08,
+        map: mapInstance.current, center: { lat, lng }, radius: r * 1000, clickable: false,
+      })
+    }
+  }, [hubLat, hubLng, radius])
+
+  function fitMapToBounds(pcs) {
+    if (!mapInstance.current || !pcs.length) return
+    const bounds = new window.google.maps.LatLngBounds()
+    pcs.forEach(p => {
+      if (p.centroid_lat && p.centroid_lng) bounds.extend({ lat: p.centroid_lat, lng: p.centroid_lng })
+    })
+    if (!bounds.isEmpty()) mapInstance.current.fitBounds(bounds)
+  }
+
+  function fillFromCoords(lat, lng, name) {
+    setHubLat(lat.toFixed(6))
+    setHubLng(lng.toFixed(6))
+    if (name && !hubName.trim()) setHubName(name)
+    if (pendingMarker.current) pendingMarker.current.setMap(null)
+    pendingMarker.current = new window.google.maps.Marker({
+      position: { lat, lng }, map: mapInstance.current,
+      icon: {
+        path: window.google.maps.SymbolPath.CIRCLE, scale: 8,
+        fillColor: '#dc2626', fillOpacity: 0.9, strokeColor: '#fff', strokeWeight: 2,
+      },
+      title: 'Pending hub',
+    })
+    setStatusOk(`Pending: ${lat.toFixed(4)}, ${lng.toFixed(4)} — adjust radius and click 'Add Hub'`)
+  }
+
+  async function geocodeAndFill(query, label) {
+    const geocoder = new window.google.maps.Geocoder()
+    geocoder.geocode({ address: query }, (results, st) => {
+      if (st === 'OK' && results[0]) {
+        const loc = results[0].geometry.location
+        mapInstance.current.panTo(loc); mapInstance.current.setZoom(13)
+        fillFromCoords(loc.lat(), loc.lng())
+        setStatusOk(`${label} ${query} — lat/long auto-filled`)
+      } else {
+        setStatusErr(`Could not find '${query}' (${st})`)
+      }
+    })
+  }
+
+  useEffect(() => {
+    if (mode === 'area' && subDistrict && !village) {
+      geocodeAndFill([subDistrict, district, 'India'].filter(Boolean).join(', '), 'Sub-district:')
+    }
+  }, [subDistrict, mode])
+
+  useEffect(() => {
+    if (mode === 'area' && village) {
+      geocodeAndFill([village, subDistrict, district, 'India'].filter(Boolean).join(', '), 'Village:')
+    }
+  }, [village, mode])
+
+  async function addHub() {
+    if (!hubLat || !hubLng) { setStatusErr('Click on map or search a place first'); return }
+    const lat = parseFloat(hubLat), lng = parseFloat(hubLng)
+    if (isNaN(lat) || isNaN(lng)) { setStatusErr('Invalid lat/lng'); return }
+    const name = hubName.trim() || `Hub ${hubs.length + 1}`
+    setStatusOk('Saving hub…')
+    try {
+      const res = await api(`/api/district/${encodeURIComponent(state)}/${encodeURIComponent(district)}/hubs`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name, lat, lng,
+          radius_km: parseFloat(radius),
+          placement_method: mode,
+          sub_district: subDistrict || null,
+          village: village || null,
+        }),
+      })
+      const fresh = await api(`/api/district/hubs?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`)
+      setHubs(fresh.map(h => ({
+        id: h.id, name: h.hub_name,
+        lat: h.hub_lat, lng: h.hub_lng,
+        radius_km: h.radius_km,
+        pincodes: h.pincodes || [],
+      })))
+      setHubName(''); setHubLat(''); setHubLng('')
+      if (searchInputRef.current) searchInputRef.current.value = ''
+      if (pendingMarker.current) { pendingMarker.current.setMap(null); pendingMarker.current = null }
+      if (previewCircle.current) { previewCircle.current.setMap(null); previewCircle.current = null }
+      setStatusOk(`Added '${name}' — found ${res.pincodes_found} pincodes`)
+    } catch (e) {
+      setStatusErr(`Add failed: ${e.message}`)
+    }
+  }
+
+  async function deleteHub(id) {
+    try {
+      await api(`/api/hub/${id}`, { method: 'DELETE' })
+      setHubs(hubs.filter(h => h.id !== id))
+      setStatusOk('Hub deleted')
+    } catch (e) {
+      setStatusErr(`Delete failed: ${e.message}`)
+    }
+  }
+
+  function saveAsDraft() {
+    setDraftSaved(true)
+    setStatusOk(`✓ Draft saved · ${hubs.length} hubs · ${uniquePincodes.size} pincodes`)
+    setTimeout(() => setDraftSaved(false), 2000)
+  }
+
+  async function finalize() {
+    if (!confirm(`Finalize ${district}? After this, no more hubs can be added or removed.`)) return
+    try {
+      await api(`/api/district/${encodeURIComponent(state)}/${encodeURIComponent(district)}/finalize`, {
+        method: 'POST',
+        body: JSON.stringify({ finalized_by: 'admin' }),
+      })
+      setStatusOk(`Finalized ${district}`)
+      const s = await api(`/api/district/stats?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`)
+      setStats(s)
+    } catch (e) {
+      setStatusErr(`Finalize failed: ${e.message}`)
+    }
+  }
+
+  function setStatusOk(msg) { setStatus(msg); setStatusType('success') }
+  function setStatusErr(msg) { setStatus(msg); setStatusType('error') }
+
+  const totalRows = hubs.reduce((sum, h) => sum + h.pincodes.filter(p => !p.is_excluded).length, 0)
+  const uniquePincodes = new Set()
+  hubs.forEach(h => h.pincodes.forEach(p => { if (!p.is_excluded) uniquePincodes.add(p.pincode) }))
+  const excludedCount = hubs.reduce((sum, h) => sum + h.pincodes.filter(p => p.is_excluded).length, 0)
+  const isFinalized = stats?.status === 'FINALIZED'
+
+  return (
+    <>
+      <div className={`status-bar ${statusType}`}>{status}</div>
+      <div className="layout">
+        <aside className="sidebar">
+          <h2>1. District</h2>
+          <label>State</label>
+          <select value={state} onChange={e => { setState(e.target.value); setDistrict('') }}>
+            <option value="">— Choose —</option>
+            {states.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <label>District (required)</label>
+          <select value={district} onChange={e => setDistrict(e.target.value)} disabled={!state}>
+            <option value="">— Choose —</option>
+            {districts.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+
+          {stats && (
+            <>
+              <h2>2. District Stats</h2>
+              <div className="stat-grid">
+                <div className="stat"><div className="label">Pincodes</div><div className="value">{stats.pincodes}</div></div>
+                <div className="stat"><div className="label">With polygon</div><div className="value">{stats.pincodes_with_polygon}</div></div>
+                <div className="stat"><div className="label">Sub-districts</div><div className="value">{stats.sub_districts}</div></div>
+                <div className="stat"><div className="label">Villages</div><div className="value">{stats.villages}</div></div>
+              </div>
+              {isFinalized && (
+                <div className="finalized-banner">
+                  ✅ Finalized — read-only. Use the Serviceability page to download.
+                </div>
+              )}
+            </>
+          )}
+
+          {district && !isFinalized && (
+            <>
+              <h2>3. Position the Hub</h2>
+              <div className="mode-toggle">
+                <button className={mode === 'search' ? 'active' : ''} onClick={() => setMode('search')}>🔍 Search</button>
+                <button className={mode === 'area' ? 'active' : ''} onClick={() => setMode('area')}>📍 Pick by area</button>
+              </div>
+
+              {mode === 'search' ? (
+                <>
+                  <label>Search a place (within {district})</label>
+                  <input ref={searchInputRef} type="text"
+                         placeholder={`e.g., railway station in ${district}`} />
+                  <div className="muted">Suggestions limited to {district} only. Or click on the map.</div>
+                </>
+              ) : (
+                <>
+                  <label>Sub-district</label>
+                  <select value={subDistrict} onChange={e => { setSubDistrict(e.target.value); setVillage('') }}>
+                    <option value="">— Choose —</option>
+                    {subDistricts.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                  <label>Village (optional)</label>
+                  <select value={village} onChange={e => setVillage(e.target.value)} disabled={!subDistrict}>
+                    <option value="">— Choose —</option>
+                    {villages.map(v => <option key={v} value={v}>{v}</option>)}
+                  </select>
+                  <div className="muted">Lat/long auto-filled from selection. Click elsewhere on map to override.</div>
+                </>
+              )}
+
+              <h2>4. Hub Details</h2>
+              <label>Hub Name</label>
+              <input type="text" value={hubName} onChange={e => setHubName(e.target.value)}
+                     placeholder="e.g., Center Hub" />
+              <div className="row2">
+                <div>
+                  <label>Latitude</label>
+                  <input type="number" step="0.000001" value={hubLat}
+                         onChange={e => setHubLat(e.target.value)} />
+                </div>
+                <div>
+                  <label>Longitude</label>
+                  <input type="number" step="0.000001" value={hubLng}
+                         onChange={e => setHubLng(e.target.value)} />
+                </div>
+              </div>
+              <label>Radius (km) — preview shown live on map</label>
+              <input type="number" step="0.5" min="1" max="200" value={radius}
+                     onChange={e => setRadius(e.target.value)} />
+              <button className="primary" onClick={addHub} disabled={!hubLat || !hubLng}>
+                Add Hub & Find Pincodes
+              </button>
+            </>
+          )}
+
+          {hubs.length > 0 && (
+            <>
+              <h2>5. Hubs ({hubs.length})</h2>
+              {hubs.map((h, i) => {
+                const active = h.pincodes.filter(p => !p.is_excluded).length
+                const excluded = h.pincodes.length - active
+                return (
+                  <div key={h.id} className="hub-card" style={{ borderLeftColor: HUB_COLORS[i % HUB_COLORS.length] }}>
+                    <div className="hub-title">
+                      <span>#{i + 1} {h.name}</span>
+                      {!isFinalized && <button className="remove" onClick={() => deleteHub(h.id)}>remove</button>}
+                    </div>
+                    <div className="hub-meta">
+                      {h.lat.toFixed(4)}, {h.lng.toFixed(4)} • r={h.radius_km} km •
+                      <b> {active}</b> active{excluded > 0 ? ` (${excluded} excluded)` : ''}
+                    </div>
+                  </div>
+                )
+              })}
+              <h2>6. Coverage Summary</h2>
+              <div className="stat-grid">
+                <div className="stat"><div className="label">Active rows</div><div className="value">{totalRows}</div></div>
+                <div className="stat"><div className="label">Unique pincodes</div><div className="value">{uniquePincodes.size}</div></div>
+              </div>
+              {excludedCount > 0 && (
+                <div className="muted" style={{ marginTop: '4px' }}>
+                  {excludedCount} pincode{excludedCount > 1 ? 's' : ''} excluded (click to re-include).
+                </div>
+              )}
+
+              {!isFinalized && (
+                <>
+                  <div className="autosave-indicator">
+                    <span className="autosave-dot" />
+                    Auto-saved · {hubs.length} hub{hubs.length === 1 ? '' : 's'} · {uniquePincodes.size} pincode{uniquePincodes.size === 1 ? '' : 's'}
+                  </div>
+                  <button className={draftSaved ? 'saved' : 'secondary'} onClick={saveAsDraft}>
+                    {draftSaved ? '✓ Draft saved' : '💾 Save as Draft'}
+                  </button>
+                  <button className="warning" onClick={finalize}>
+                    🔒 Finalize district
+                  </button>
+                </>
+              )}
+              {isFinalized && (
+                <div className="muted" style={{ marginTop: '8px' }}>
+                  This district is locked. Visit the Serviceability page to download data.
+                </div>
+              )}
+            </>
+          )}
+        </aside>
+        <div className="map-wrap">
+          <div ref={mapRef} className="map" />
+        </div>
+      </div>
+    </>
+  )
+}
+
+
+// ============================================================================
+// SERVICEABILITY VIEW
+// ============================================================================
+
+function ServiceabilityView({ jumpToBuilder }) {
+  const [overview, setOverview] = useState([])
+  const [summary, setSummary] = useState(null)
+  const [filterState, setFilterState] = useState('')
+  const [filterStatus, setFilterStatus] = useState('')
+  const [search, setSearch] = useState('')
+  const [detail, setDetail] = useState(null) // null = list view; { state, district, ... } = detail view
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  async function loadOverview() {
+    setLoading(true)
+    setError('')
+    try {
+      const params = new URLSearchParams()
+      if (filterState) params.append('state', filterState)
+      if (filterStatus) params.append('status', filterStatus)
+      if (search) params.append('search', search)
+      const [list, sum] = await Promise.all([
+        api(`/api/serviceability/overview?${params.toString()}`),
+        api('/api/serviceability/summary'),
+      ])
+      setOverview(list)
+      setSummary(sum)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { loadOverview() }, [filterState, filterStatus])
+
+  // Debounced search
+  useEffect(() => {
+    const t = setTimeout(() => loadOverview(), 300)
+    return () => clearTimeout(t)
+  }, [search])
+
+  async function openDetail(state, district) {
+    setLoading(true)
+    setError('')
+    try {
+      const d = await api(`/api/serviceability/district?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`)
+      setDetail({ state, district, ...d })
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function downloadDistrict(district) {
+    window.location.href = `/api/export/district?district=${encodeURIComponent(district)}`
+  }
+  function downloadDrafts() {
+    window.location.href = '/api/export/drafts'
+  }
+  function downloadFinalized() {
+    window.location.href = '/api/export/finalized'
+  }
+
+  // Top-level metrics
+  const totalDistricts = summary?.total_districts ?? 0
+  const draftDistricts = summary?.draft_districts ?? 0
+  const finalDistricts = summary?.finalized_districts ?? 0
+  const totalHubs = summary?.total_hubs ?? 0
+  const activeRows = summary?.active_coverage_rows ?? 0
+  const excludedRows = summary?.excluded_coverage_rows ?? 0
+
+  // Distinct states for filter dropdown
+  const stateOptions = Array.from(new Set(overview.map(d => d.state))).sort()
+
+  if (detail) {
+    return <ServiceabilityDetail detail={detail} onBack={() => setDetail(null)}
+                                  jumpToBuilder={jumpToBuilder}
+                                  onDownload={() => downloadDistrict(detail.district)} />
+  }
+
+  return (
+    <main className="serv-page">
+      <div className="serv-header">
+        <div>
+          <div className="serv-title">Serviceability Overview</div>
+          <div className="serv-sub">All districts that have been worked on. DRAFT districts can still be edited from the Builder. FINALIZED districts are locked.</div>
+        </div>
+      </div>
+
+      {error && <div className="serv-error">{error}</div>}
+
+      <div className="serv-stats">
+        <div className="serv-stat-card highlight">
+          <div className="label">Districts</div>
+          <div className="value">{totalDistricts}</div>
+          <div className="delta">{draftDistricts} draft · {finalDistricts} finalized</div>
+        </div>
+        <div className="serv-stat-card">
+          <div className="label">Total hubs</div>
+          <div className="value">{totalHubs}</div>
+          <div className="delta">{totalDistricts > 0 ? `avg ${(totalHubs / totalDistricts).toFixed(1)} / district` : '—'}</div>
+        </div>
+        <div className="serv-stat-card">
+          <div className="label">Active rows</div>
+          <div className="value">{activeRows}</div>
+          <div className="delta">across all hubs</div>
+        </div>
+        <div className="serv-stat-card warn">
+          <div className="label">Excluded</div>
+          <div className="value">{excludedRows}</div>
+          <div className="delta">manually removed by ops</div>
+        </div>
+      </div>
+
+      <div className="filter-bar">
+        <select value={filterState} onChange={e => setFilterState(e.target.value)}>
+          <option value="">All states</option>
+          {stateOptions.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="DRAFT">Draft</option>
+          <option value="FINALIZED">Finalized</option>
+        </select>
+        <input type="text" className="search" placeholder="Search district name…"
+               value={search} onChange={e => setSearch(e.target.value)} />
+        <button onClick={loadOverview}>↻ Refresh</button>
+      </div>
+
+      <div className="serv-table-wrap">
+        {loading ? (
+          <div className="serv-empty">Loading…</div>
+        ) : overview.length === 0 ? (
+          <div className="serv-empty">
+            <div className="ico">📭</div>
+            No districts have been worked on yet. Go to the Builder to add your first hub.
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>State</th>
+                <th>District</th>
+                <th>Status</th>
+                <th className="right">Hubs</th>
+                <th className="right">Pincodes (excluded)</th>
+                <th>Last updated</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {overview.map(d => (
+                <tr key={`${d.state}|${d.district}`}>
+                  <td>{d.state}</td>
+                  <td className="district-name" onClick={() => openDetail(d.state, d.district)}>
+                    {d.district}
+                  </td>
+                  <td>
+                    <span className={`pill ${d.status === 'FINALIZED' ? 'final' : 'draft'}`}>
+                      <span className="dot" />
+                      {d.status === 'FINALIZED' ? 'Finalized' : 'Draft'}
+                    </span>
+                  </td>
+                  <td className="right">{d.hub_count}</td>
+                  <td className="right">
+                    {d.active_pincodes}
+                    {d.excluded_pincodes > 0 && (
+                      <span style={{ color: '#dc2626' }}> ({d.excluded_pincodes})</span>
+                    )}
+                  </td>
+                  <td>{formatTimeAgo(d.updated_at || d.finalized_at)}</td>
+                  <td>
+                    <div className="row-actions">
+                      <button className="action-primary" onClick={() => openDetail(d.state, d.district)}>View</button>
+                      <button className="action-export" onClick={() => downloadDistrict(d.district)}>📥</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="bulk-bar">
+        <button className="bulk-draft" onClick={downloadDrafts} disabled={draftDistricts === 0}>
+          📥 Download all DRAFT districts
+          <span className="desc">{draftDistricts} district{draftDistricts === 1 ? '' : 's'} · one tab per district</span>
+        </button>
+        <button className="bulk-final" onClick={downloadFinalized} disabled={finalDistricts === 0}>
+          📥 Download all FINALIZED districts
+          <span className="desc">{finalDistricts} district{finalDistricts === 1 ? '' : 's'} · one tab per district</span>
+        </button>
+      </div>
+    </main>
+  )
+}
+
+
+function ServiceabilityDetail({ detail, onBack, jumpToBuilder, onDownload }) {
+  const { state, district, status, hubs, coverage } = detail
+  const isFinalized = status?.status === 'FINALIZED'
+  const activeCount = coverage.filter(c => !c.is_excluded).length
+  const excludedCount = coverage.filter(c => c.is_excluded).length
+
+  return (
+    <main className="serv-page">
+      <span className="serv-back" onClick={onBack}>← Back to Serviceability</span>
+
+      <div className="serv-detail-header">
+        <div className="serv-title">{district}, {state}</div>
+        <span className={`pill ${isFinalized ? 'final' : 'draft'}`}>
+          <span className="dot" />
+          {isFinalized ? 'Finalized' : 'Draft'}
+        </span>
+      </div>
+      <div className="serv-sub">
+        {hubs.length} hub{hubs.length === 1 ? '' : 's'} ·
+        {' '}{activeCount} active pincode{activeCount === 1 ? '' : 's'}
+        {excludedCount > 0 ? ` (${excludedCount} excluded)` : ''}
+        {status?.finalized_at && ` · Finalized ${formatTimeAgo(status.finalized_at)} by ${status.finalized_by}`}
+      </div>
+
+      <div className="serv-detail-grid">
+        <div>
+          <h3>Hubs ({hubs.length})</h3>
+          {hubs.map((h, i) => (
+            <div key={h.id} className="serv-hub-card" style={{ borderLeftColor: HUB_COLORS[i % HUB_COLORS.length] }}>
+              <div className="serv-hub-name">#{i + 1} {h.hub_name}</div>
+              <div className="serv-hub-meta">
+                {h.hub_lat.toFixed(4)}, {h.hub_lng.toFixed(4)} · r={h.radius_km} km
+              </div>
+            </div>
+          ))}
+        </div>
+        <div>
+          <h3>Coverage ({coverage.length})</h3>
+          <div className="serv-coverage-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Pincode</th><th>City</th><th>Hub</th><th className="right">km</th><th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {coverage.map(c => (
+                  <tr key={c.id} className={c.is_excluded ? 'excluded-row' : ''}>
+                    <td><b>{c.pincode}</b></td>
+                    <td>{c.city || '—'}</td>
+                    <td>{c.hub_name}</td>
+                    <td className="right">{c.distance_km}</td>
+                    <td>
+                      {c.is_excluded
+                        ? <span className="excluded-pill">Excluded</span>
+                        : <span className="active-pill">Active</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div className="serv-detail-actions">
+        {!isFinalized && (
+          <button className="action-primary"
+                  onClick={() => jumpToBuilder({ state, district })}>
+            ↩ Continue editing in Builder
+          </button>
+        )}
+        <button className="action-export" onClick={onDownload}>
+          📥 Download this district (Excel)
+        </button>
+        <button className="action-secondary" onClick={onBack}>Close</button>
+      </div>
+    </main>
+  )
+}
+
+
+// ============================================================================
+// ROOT APP — header + tab routing
+// ============================================================================
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('builder')
+  const [builderPrefill, setBuilderPrefill] = useState(null)
+
+  function jumpToBuilder(prefill) {
+    setBuilderPrefill(prefill)
+    setActiveTab('builder')
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <div className="brand">
+          <h1>🚚 daak</h1>
+          <span className="badge">v0.3</span>
+        </div>
+        <div className="tabs">
+          <div className={`tab ${activeTab === 'builder' ? 'active' : ''}`}
+               onClick={() => setActiveTab('builder')}>
+            Builder
+          </div>
+          <div className={`tab ${activeTab === 'serv' ? 'active' : ''}`}
+               onClick={() => setActiveTab('serv')}>
+            Serviceability
+          </div>
+        </div>
+        <div className="spacer" />
+        <div className="meta">admin</div>
+      </header>
+
+      {activeTab === 'builder' ? (
+        <BuilderView
+          prefilled={builderPrefill}
+          onPrefilledHandled={() => setBuilderPrefill(null)}
+        />
+      ) : (
+        <ServiceabilityView jumpToBuilder={jumpToBuilder} />
+      )}
+    </div>
+  )
+}
