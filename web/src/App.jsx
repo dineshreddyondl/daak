@@ -952,7 +952,8 @@ export default function App() {
     <div className="app">
       <header>
         <div className="brand">
-          <h1>🚚 DAAK</h1>
+          <img src="/ondl-logo.png" alt="ONDL" className="brand-logo" />
+          <h1>DAAK</h1>
           <span className="badge">Beta</span>
         </div>
         <div className="tabs">

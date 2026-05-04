@@ -20,6 +20,12 @@ header .brand {
   display: flex; align-items: center; gap: 10px;
   padding-right: 24px; border-right: 1px solid #374151;
 }
+.brand-logo {
+  height: 32px; width: 32px;
+  border-radius: 4px;
+  object-fit: contain;
+  display: block;
+}
 header h1 { font-size: 16px; font-weight: 600; }
 .badge {
   background: #fbbf24; color: #111827; padding: 2px 8px;
