@@ -2,8 +2,6 @@ import React, { useEffect, useRef, useState } from 'react'
 
 const HUB_COLORS = ['#dc2626', '#9333ea', '#0891b2', '#ca8a04', '#15803d', '#be185d']
 
-// In production, frontend talks to API at VITE_API_URL.
-// In dev, the empty string lets Vite's proxy forward /api to localhost:8000.
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
 async function api(path, opts = {}) {
@@ -87,10 +85,18 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
   const searchInputRef = useRef(null)
   const districtBoundsRef = useRef(null)
 
-  // Pre-select if Serviceability passed us a state/district
+  // Pre-select state/district/sub_district/village from Search or Serviceability
   useEffect(() => {
     if (prefilled?.state) setState(prefilled.state)
     if (prefilled?.district) setDistrict(prefilled.district)
+    if (prefilled?.sub_district) {
+      // Defer slightly so the sub_districts list has loaded
+      setTimeout(() => setSubDistrict(prefilled.sub_district), 100)
+    }
+    if (prefilled?.village) {
+      setMode('area')
+      setTimeout(() => setVillage(prefilled.village), 200)
+    }
     if (prefilled) onPrefilledHandled?.()
   }, [prefilled])
 
@@ -661,7 +667,7 @@ function ServiceabilityView({ jumpToBuilder }) {
   const [filterState, setFilterState] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [search, setSearch] = useState('')
-  const [detail, setDetail] = useState(null) // null = list view; { state, district, ... } = detail view
+  const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -688,7 +694,6 @@ function ServiceabilityView({ jumpToBuilder }) {
 
   useEffect(() => { loadOverview() }, [filterState, filterStatus])
 
-  // Debounced search
   useEffect(() => {
     const t = setTimeout(() => loadOverview(), 300)
     return () => clearTimeout(t)
@@ -710,22 +715,16 @@ function ServiceabilityView({ jumpToBuilder }) {
   function downloadDistrict(district) {
     window.location.href = `${API_BASE}/api/export/district?district=${encodeURIComponent(district)}`
   }
-  function downloadDrafts() {
-    window.location.href = `${API_BASE}/api/export/drafts`
-  }
-  function downloadFinalized() {
-    window.location.href = `${API_BASE}/api/export/finalized`
-  }
+  function downloadDrafts()    { window.location.href = `${API_BASE}/api/export/drafts` }
+  function downloadFinalized() { window.location.href = `${API_BASE}/api/export/finalized` }
 
-  // Top-level metrics
   const totalDistricts = summary?.total_districts ?? 0
   const draftDistricts = summary?.draft_districts ?? 0
   const finalDistricts = summary?.finalized_districts ?? 0
-  const totalHubs = summary?.total_hubs ?? 0
-  const activeRows = summary?.active_coverage_rows ?? 0
-  const excludedRows = summary?.excluded_coverage_rows ?? 0
+  const totalHubs      = summary?.total_hubs ?? 0
+  const activeRows     = summary?.active_coverage_rows ?? 0
+  const excludedRows   = summary?.excluded_coverage_rows ?? 0
 
-  // Distinct states for filter dropdown
   const stateOptions = Array.from(new Set(overview.map(d => d.state))).sort()
 
   if (detail) {
@@ -936,12 +935,703 @@ function ServiceabilityDetail({ detail, onBack, jumpToBuilder, onDownload }) {
 
 
 // ============================================================================
-// ROOT APP — header + tab routing
+// SEARCH VIEW
 // ============================================================================
+
+function SearchView({ jumpToBuilder }) {
+  const [subTab, setSubTab] = useState('single')
+
+  return (
+    <main className="search-page">
+      <div className="search-subtabs">
+        <button className={`search-subtab ${subTab === 'single' ? 'active' : ''}`}
+                onClick={() => setSubTab('single')}>
+          Single Search
+        </button>
+        <button className={`search-subtab ${subTab === 'bulk' ? 'active' : ''}`}
+                onClick={() => setSubTab('bulk')}>
+          Bulk Lookup
+        </button>
+      </div>
+
+      {subTab === 'single'
+        ? <SingleSearch jumpToBuilder={jumpToBuilder} />
+        : <BulkLookup />
+      }
+    </main>
+  )
+}
+
+// ─── SingleSearch sub-view ────────────────────────────────────────────────────
+function SingleSearch({ jumpToBuilder }) {
+  const [activeType, setActiveType] = useState('all')
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState([])
+  const [resultsHeader, setResultsHeader] = useState('Type to search')
+  const [selected, setSelected] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const debounceRef = useRef(null)
+
+  // Run debounced search whenever query or filter changes
+  useEffect(() => {
+    clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(async () => {
+      const q = query.trim()
+      if (!q) {
+        setResults([])
+        setResultsHeader('Type to search')
+        return
+      }
+      setLoading(true)
+      try {
+        const params = new URLSearchParams({ q, limit: '30' })
+        if (activeType !== 'all') params.set('types', activeType)
+        const data = await api(`/api/search?${params}`)
+        setResults(data.results || [])
+        setResultsHeader(`${data.count} result${data.count === 1 ? '' : 's'} for "${data.query}"`)
+      } catch (e) {
+        setResults([])
+        setResultsHeader(`Error: ${e.message}`)
+      } finally {
+        setLoading(false)
+      }
+    }, 250)
+    return () => clearTimeout(debounceRef.current)
+  }, [query, activeType])
+
+  return (
+    <>
+      <div className="s-search-bar">
+        <div className="s-pills">
+          {[
+            { v: 'all', l: 'All' },
+            { v: 'district', l: 'District' },
+            { v: 'sub_district', l: 'Sub-district' },
+            { v: 'village', l: 'Village' },
+            { v: 'pincode', l: 'Pincode' },
+          ].map(t => (
+            <button key={t.v}
+                    className={`s-pill ${activeType === t.v ? 'active' : ''}`}
+                    onClick={() => setActiveType(t.v)}>
+              {t.l}
+            </button>
+          ))}
+        </div>
+        <div className="s-input-wrap">
+          <span className="s-icon">⌕</span>
+          <input
+            type="text" className="s-input"
+            placeholder="Type a district, sub-district, village, or pincode…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            autoFocus
+          />
+          <div className={`s-loader ${loading ? 'show' : ''}`} />
+        </div>
+      </div>
+
+      <div className="s-grid">
+        <div className="s-results">
+          <div className="s-results-header">{resultsHeader}</div>
+          <div className="s-results-list">
+            {results.length === 0 ? (
+              <div className="s-empty">
+                <div className="big">⌕</div>
+                <div>{query ? 'No matches.' : 'Search across districts, sub-districts, villages, and pincodes.'}</div>
+              </div>
+            ) : (
+              results.map((r, idx) => (
+                <div key={idx}
+                     className={`s-result ${selected === r ? 'selected' : ''}`}
+                     onClick={() => setSelected(r)}>
+                  <span className={`s-result-tag s-tag-${r.entity_type}`}>
+                    {r.entity_type === 'sub_district' ? 'Sub-dist' : r.entity_type}
+                  </span>
+                  <div className="s-result-body">
+                    <div className={`s-result-name ${r.entity_type === 'pincode' ? 'mono' : ''}`}>
+                      {r.name}
+                    </div>
+                    <div className="s-result-path">{r.parent_path || r.state || ''}</div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="s-detail">
+          {selected ? (
+            <DetailPanel result={selected}
+                         onSelect={setSelected}
+                         jumpToBuilder={jumpToBuilder} />
+          ) : (
+            <div className="s-detail-empty">
+              <div className="big">📍</div>
+              <div>Click a search result to see details and location.</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ─── DetailPanel — fields, drilldown, map preview, Open in Builder ────────────
+function DetailPanel({ result, onSelect, jumpToBuilder }) {
+  const isPincode = result.entity_type === 'pincode'
+  const cityFromMeta = result.metadata?.city || null
+  const hasLatLng = result.centroid_lat != null && result.centroid_lng != null
+
+  // Map ref + lifecycle
+  const mapRef = useRef(null)
+  const mapInstance = useRef(null)
+  const markerRef = useRef(null)
+
+  useEffect(() => {
+    if (!hasLatLng || !mapRef.current) return
+    if (!mapInstance.current) {
+      mapInstance.current = new window.google.maps.Map(mapRef.current, {
+        center: { lat: result.centroid_lat, lng: result.centroid_lng },
+        zoom: 12,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: true,
+      })
+    } else {
+      mapInstance.current.setCenter({ lat: result.centroid_lat, lng: result.centroid_lng })
+      mapInstance.current.setZoom(12)
+    }
+    if (markerRef.current) markerRef.current.setMap(null)
+    markerRef.current = new window.google.maps.Marker({
+      position: { lat: result.centroid_lat, lng: result.centroid_lng },
+      map: mapInstance.current,
+      icon: {
+        path: window.google.maps.SymbolPath.CIRCLE, scale: 8,
+        fillColor: '#10b981', fillOpacity: 0.7,
+        strokeColor: '#065f46', strokeWeight: 2,
+      },
+      title: result.name,
+    })
+  }, [result.centroid_lat, result.centroid_lng])
+
+  // Reset map instance when switching to non-pincode results
+  useEffect(() => {
+    if (!hasLatLng) {
+      mapInstance.current = null
+      if (markerRef.current) { markerRef.current.setMap(null); markerRef.current = null }
+    }
+  }, [hasLatLng])
+
+  function handleOpenInBuilder() {
+    const prefill = {
+      state: result.state,
+      district: result.district,
+      sub_district: result.sub_district || undefined,
+      village: result.entity_type === 'village' ? result.name : undefined,
+    }
+    jumpToBuilder(prefill)
+  }
+
+  return (
+    <>
+      <div className="s-detail-header">
+        <div className="s-detail-header-text">
+          <div className={`s-detail-title ${isPincode ? 'mono' : ''}`}>{result.name}</div>
+          <div className="s-detail-meta">
+            <span className={`s-result-tag s-tag-${result.entity_type}`} style={{ marginRight: 8 }}>
+              {result.entity_type === 'sub_district' ? 'Sub-dist' : result.entity_type}
+            </span>
+            {result.parent_path || result.state || ''}
+          </div>
+        </div>
+        {result.entity_type !== 'pincode' && result.state && result.district && (
+          <button className="s-action-btn" onClick={handleOpenInBuilder}>
+            Open in Builder →
+          </button>
+        )}
+      </div>
+
+      <div className="s-detail-body">
+        <FieldGrid result={result} cityFromMeta={cityFromMeta} />
+
+        {result.entity_type === 'district' && (
+          <DistrictDrilldown result={result} onSelect={onSelect} />
+        )}
+        {result.entity_type === 'sub_district' && (
+          <SubDistrictDrilldown result={result} onSelect={onSelect} />
+        )}
+
+        <div className="s-map-section">
+          <div className="s-map-label">Location</div>
+          {hasLatLng ? (
+            <div ref={mapRef} className="s-map" />
+          ) : (
+            <div className="s-map-empty">
+              <div>📍</div>
+              <div>Map preview only available for pincode results</div>
+              <div style={{ fontSize: 11, opacity: 0.7 }}>
+                (districts/villages don't carry coordinates in the search index)
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+function FieldGrid({ result, cityFromMeta }) {
+  const fields = []
+  const fmt = (v) => v ?? '—'
+
+  if (result.entity_type === 'district') {
+    fields.push(['State', fmt(result.state)], ['District', fmt(result.district)])
+  } else if (result.entity_type === 'sub_district') {
+    fields.push(['State', fmt(result.state)], ['District', fmt(result.district)],
+                ['Sub-district', fmt(result.sub_district)])
+  } else if (result.entity_type === 'village') {
+    fields.push(['State', fmt(result.state)], ['District', fmt(result.district)],
+                ['Sub-district', fmt(result.sub_district)], ['Village', result.name])
+  } else if (result.entity_type === 'pincode') {
+    fields.push(
+      ['Pincode', result.pincode, 'mono'],
+      ['City', fmt(cityFromMeta)],
+      ['District', fmt(result.district)],
+      ['State', fmt(result.state)],
+      ['Centroid',
+        result.centroid_lat
+          ? `${result.centroid_lat.toFixed(4)}, ${result.centroid_lng.toFixed(4)}`
+          : 'missing',
+        'mono'],
+    )
+  }
+
+  return (
+    <div className="s-fields">
+      {fields.map(([label, val, mod], i) => (
+        <div className="s-field" key={i}>
+          <div className="s-field-label">{label}</div>
+          <div className={`s-field-value ${mod || ''} ${val === '—' || val === 'missing' ? 'muted' : ''}`}>
+            {val}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function DistrictDrilldown({ result, onSelect }) {
+  const [data, setData] = useState(null)
+  const [openSec, setOpenSec] = useState({})
+
+  useEffect(() => {
+    let cancelled = false
+    setData(null)
+    Promise.all([
+      api(`/api/sub_districts?state=${encodeURIComponent(result.state)}&district=${encodeURIComponent(result.district)}`),
+      api(`/api/villages?state=${encodeURIComponent(result.state)}&district=${encodeURIComponent(result.district)}`),
+      api(`/api/district/pincodes?district=${encodeURIComponent(result.district)}`),
+    ]).then(([subs, vills, pins]) => {
+      if (!cancelled) setData({ subs, vills, pins })
+    }).catch(() => { if (!cancelled) setData({ subs: [], vills: [], pins: [] }) })
+    return () => { cancelled = true }
+  }, [result.state, result.district])
+
+  if (!data) return <div className="s-drill-empty">Loading children…</div>
+
+  const { subs, vills, pins } = data
+
+  function selectSub(sd) {
+    onSelect({
+      entity_type: 'sub_district',
+      name: sd, state: result.state, district: result.district,
+      sub_district: sd, pincode: null,
+      centroid_lat: null, centroid_lng: null, metadata: {},
+      parent_path: `${result.state} · ${result.district}`,
+    })
+  }
+
+  async function selectVillageFlat(v) {
+    // Look up full record via search to get sub_district
+    try {
+      const params = new URLSearchParams({ q: v, types: 'village', limit: '20' })
+      const data = await api(`/api/search?${params}`)
+      const match = (data.results || []).find(x =>
+        x.name === v && x.district === result.district && x.state === result.state)
+      if (match) { onSelect(match); return }
+    } catch {}
+    onSelect({
+      entity_type: 'village',
+      name: v, state: result.state, district: result.district,
+      sub_district: null, pincode: null,
+      centroid_lat: null, centroid_lng: null, metadata: {},
+      parent_path: `${result.state} · ${result.district}`,
+    })
+  }
+
+  function selectPincode(p) {
+    onSelect({
+      entity_type: 'pincode',
+      name: String(p.pincode), state: p.state || result.state,
+      district: p.district || result.district, sub_district: null,
+      pincode: String(p.pincode),
+      centroid_lat: p.centroid_lat ?? null,
+      centroid_lng: p.centroid_lng ?? null,
+      metadata: p.city ? { city: p.city } : {},
+      parent_path: `${p.state || result.state} · ${p.district || result.district}`,
+    })
+  }
+
+  const toggle = key => setOpenSec(s => ({ ...s, [key]: !s[key] }))
+
+  return (
+    <>
+      <div className="s-statbar">
+        <div className="s-statcard"><div className="num">{subs.length}</div><div className="lbl">Sub-districts</div></div>
+        <div className="s-statcard"><div className="num">{vills.length}</div><div className="lbl">Villages</div></div>
+        <div className="s-statcard"><div className="num">{pins.length}</div><div className="lbl">Pincodes</div></div>
+      </div>
+
+      <DrillSection
+        title="Sub-districts" count={subs.length}
+        open={!!openSec.sub} onToggle={() => toggle('sub')}>
+        {subs.length === 0
+          ? <div className="s-drill-empty">No sub-districts.</div>
+          : <div className="s-chip-grid">
+              {subs.map(sd => <span key={sd} className="s-chip" onClick={() => selectSub(sd)}>{sd}</span>)}
+            </div>}
+      </DrillSection>
+
+      <DrillSection
+        title="Villages" count={vills.length}
+        open={!!openSec.vill} onToggle={() => toggle('vill')}>
+        {vills.length === 0
+          ? <div className="s-drill-empty">No villages.</div>
+          : <div className="s-chip-grid">
+              {vills.map(v => <span key={v} className="s-chip" onClick={() => selectVillageFlat(v)}>{v}</span>)}
+            </div>}
+      </DrillSection>
+
+      <DrillSection
+        title="Pincodes" count={pins.length}
+        open={!!openSec.pin} onToggle={() => toggle('pin')}>
+        {pins.length === 0
+          ? <div className="s-drill-empty">No pincodes.</div>
+          : <div className="s-chip-grid">
+              {pins.map(p => (
+                <span key={p.pincode} className="s-chip mono pincode" onClick={() => selectPincode(p)}>
+                  {p.pincode}
+                </span>
+              ))}
+            </div>}
+      </DrillSection>
+    </>
+  )
+}
+
+function SubDistrictDrilldown({ result, onSelect }) {
+  const [villages, setVillages] = useState(null)
+  const [open, setOpen] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    setVillages(null)
+    api(`/api/villages?state=${encodeURIComponent(result.state)}&district=${encodeURIComponent(result.district)}&sub_district=${encodeURIComponent(result.sub_district)}`)
+      .then(v => { if (!cancelled) setVillages(v) })
+      .catch(() => { if (!cancelled) setVillages([]) })
+    return () => { cancelled = true }
+  }, [result.state, result.district, result.sub_district])
+
+  if (villages == null) return <div className="s-drill-empty">Loading villages…</div>
+
+  function selectVillage(v) {
+    onSelect({
+      entity_type: 'village',
+      name: v, state: result.state, district: result.district,
+      sub_district: result.sub_district, pincode: null,
+      centroid_lat: null, centroid_lng: null, metadata: {},
+      parent_path: `${result.state} · ${result.district} · ${result.sub_district}`,
+    })
+  }
+
+  return (
+    <>
+      <div className="s-statbar">
+        <div className="s-statcard">
+          <div className="num">{villages.length}</div>
+          <div className="lbl">Villages</div>
+        </div>
+      </div>
+      <DrillSection
+        title="Villages" count={villages.length}
+        open={open} onToggle={() => setOpen(!open)}>
+        {villages.length === 0
+          ? <div className="s-drill-empty">No villages.</div>
+          : <div className="s-chip-grid">
+              {villages.map(v => <span key={v} className="s-chip" onClick={() => selectVillage(v)}>{v}</span>)}
+            </div>}
+      </DrillSection>
+    </>
+  )
+}
+
+function DrillSection({ title, count, open, onToggle, children }) {
+  return (
+    <div className="s-drill">
+      <div className={`s-drill-header ${open ? 'open' : ''}`} onClick={onToggle}>
+        <span className="s-drill-chev">▸</span>
+        <span className="s-drill-title">{title}</span>
+        <span className="s-drill-count">{count}</span>
+      </div>
+      <div className={`s-drill-body ${open ? 'open' : ''}`}>{children}</div>
+    </div>
+  )
+}
+
+// ─── BulkLookup sub-view ──────────────────────────────────────────────────────
+const BULK_MAX = 500
+
+function BulkLookup() {
+  const [text, setText] = useState('')
+  const [typeOverride, setTypeOverride] = useState('')
+  const [results, setResults] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [openAlts, setOpenAlts] = useState({})
+  const [error, setError] = useState('')
+
+  const names = text
+    .split(/[\n,;]+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+
+  const counterClass =
+    names.length > BULK_MAX ? 'err' :
+    names.length > BULK_MAX * 0.8 ? 'warn' : ''
+
+  async function runLookup() {
+    if (names.length === 0 || names.length > BULK_MAX) return
+    setLoading(true)
+    setError('')
+    setOpenAlts({})
+    try {
+      const data = await api('/api/search/bulk', {
+        method: 'POST',
+        body: JSON.stringify({ names, type_override: typeOverride || null }),
+      })
+      setResults(data)
+    } catch (e) {
+      setError(e.message)
+      setResults(null)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function downloadXlsx() {
+    setExporting(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/search/bulk/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names, type_override: typeOverride || null }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      a.href = url
+      a.download = `daak_bulk_lookup_${ts}.xlsx`
+      document.body.appendChild(a); a.click(); document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`Export failed: ${e.message}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  return (
+    <>
+      <div className="bulk-input">
+        <div className="bulk-input-row">
+          <div>
+            <div className="bulk-field-label" style={{ marginBottom: 6 }}>
+              Names (one per line, max {BULK_MAX})
+            </div>
+            <textarea
+              className="bulk-textarea"
+              placeholder={'Visakhapatnam\nHyderabad\nAnandapuram\n530001\nYendada\n…'}
+              value={text}
+              onChange={e => setText(e.target.value)}
+            />
+          </div>
+          <div className="bulk-side">
+            <div className="bulk-field">
+              <span className="bulk-field-label">Type override</span>
+              <select className="bulk-select" value={typeOverride}
+                      onChange={e => setTypeOverride(e.target.value)}>
+                <option value="">Auto-detect</option>
+                <option value="district">District</option>
+                <option value="sub_district">Sub-district</option>
+                <option value="village">Village</option>
+                <option value="pincode">Pincode</option>
+              </select>
+            </div>
+            <div className="bulk-field">
+              <span className="bulk-field-label">Count</span>
+              <span className={`bulk-counter ${counterClass}`}>{names.length} / {BULK_MAX}</span>
+            </div>
+          </div>
+        </div>
+        <div className="bulk-actions">
+          <button className="primary"
+                  onClick={runLookup}
+                  disabled={loading || names.length === 0 || names.length > BULK_MAX}>
+            {loading ? 'Looking up…' : 'Lookup'}
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="serv-error">{error}</div>}
+
+      {results && (
+        <div className="bulk-results">
+          <div className="bulk-results-header">
+            <div className="bulk-results-title">Results</div>
+            <div className="bulk-summary">
+              <span>Total: {results.count}</span>
+              <span className="ok">Matched: {results.matched}</span>
+              <span className="na">NA: {results.not_found}</span>
+            </div>
+            <button className="bulk-export-btn"
+                    onClick={downloadXlsx}
+                    disabled={exporting}>
+              {exporting ? 'Generating…' : 'Download as XLSX'}
+            </button>
+          </div>
+          <div className="bulk-table-wrap">
+            <table className="bulk-table">
+              <thead>
+                <tr>
+                  <th>#</th><th>Input</th><th>Confidence</th><th>Type</th>
+                  <th>Matched Name</th><th>State</th><th>District</th>
+                  <th>Sub-district</th><th>Pincode</th><th>Alternatives</th>
+                </tr>
+              </thead>
+              <tbody>
+                {results.results.map((r, idx) => {
+                  const bm = r.best_match || {}
+                  const isNa = r.status === 'not_found'
+                  const altCount = (r.alternatives || []).length
+                  const altOpen = !!openAlts[idx]
+                  const cell = (val) => (val === 'NA' || val == null)
+                    ? <td className="col-na">NA</td>
+                    : <td>{val}</td>
+                  return (
+                    <React.Fragment key={idx}>
+                      <tr className={isNa ? 'row-na' : ''}>
+                        <td>{idx + 1}</td>
+                        <td>{r.input}</td>
+                        <td><span className={`conf-pill conf-${r.confidence}`}>{r.confidence}</span></td>
+                        <td>{bm.entity_type === 'sub_district' ? 'Sub-dist' : (bm.entity_type || 'NA')}</td>
+                        <td>{bm.name || 'NA'}</td>
+                        {cell(bm.state)}
+                        {cell(bm.district)}
+                        {cell(bm.sub_district)}
+                        {cell(bm.pincode)}
+                        <td>
+                          {altCount > 0
+                            ? <button className="alt-btn"
+                                      onClick={() => setOpenAlts(s => ({ ...s, [idx]: !s[idx] }))}>
+                                {altCount} alt
+                              </button>
+                            : <span style={{ color: 'var(--text-faint)' }}>—</span>}
+                        </td>
+                      </tr>
+                      {altOpen && (
+                        <tr className="alt-row">
+                          <td colSpan={10}>
+                            <div className="alt-list">
+                              {r.alternatives.map((a, i) => (
+                                <div key={i} className="alt-list-item">
+                                  <span className={`s-result-tag s-tag-${a.entity_type}`}>
+                                    {a.entity_type === 'sub_district' ? 'Sub-dist' : a.entity_type}
+                                  </span>
+                                  <span><strong>{a.name}</strong></span>
+                                  <span style={{ color: 'var(--text-faint)' }}>·</span>
+                                  <span>{a.state || '—'}</span>
+                                  <span style={{ color: 'var(--text-faint)' }}>·</span>
+                                  <span>{a.district || '—'}</span>
+                                  {a.sub_district && (<>
+                                    <span style={{ color: 'var(--text-faint)' }}>·</span>
+                                    <span>{a.sub_district}</span>
+                                  </>)}
+                                  {a.pincode && (<>
+                                    <span style={{ color: 'var(--text-faint)' }}>·</span>
+                                    <span style={{ fontFamily: 'monospace' }}>{a.pincode}</span>
+                                  </>)}
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+
+// ============================================================================
+// ROOT APP — header + tab routing + theme
+// ============================================================================
+
+function getInitialTheme() {
+  try {
+    const saved = localStorage.getItem('daak.theme')
+    if (saved === 'light' || saved === 'dark') return saved
+  } catch {}
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function SunIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+         strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  )
+}
+
+function MoonIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+         strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  )
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('builder')
   const [builderPrefill, setBuilderPrefill] = useState(null)
+  const [theme, setTheme] = useState(getInitialTheme)
+
+  // Apply theme to <html> and persist
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    try { localStorage.setItem('daak.theme', theme) } catch {}
+  }, [theme])
 
   function jumpToBuilder(prefill) {
     setBuilderPrefill(prefill)
@@ -951,7 +1641,12 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <div className="brand">
+        <div className="brand"
+             onClick={() => setActiveTab('builder')}
+             role="button"
+             tabIndex={0}
+             title="Go to Builder"
+             style={{ cursor: 'pointer' }}>
           <img src="/ondl-logo.png" alt="ONDL" className="brand-logo" />
           <h1>DAAK</h1>
           <span className="badge">Beta</span>
@@ -965,19 +1660,29 @@ export default function App() {
                onClick={() => setActiveTab('serv')}>
             Serviceability
           </div>
+          <div className={`tab ${activeTab === 'search' ? 'active' : ''}`}
+               onClick={() => setActiveTab('search')}>
+            Search
+          </div>
         </div>
         <div className="spacer" />
-        <div className="meta">admin</div>
+        <button
+          className="theme-toggle"
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}>
+          {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+        </button>
       </header>
 
-      {activeTab === 'builder' ? (
+      {activeTab === 'builder' && (
         <BuilderView
           prefilled={builderPrefill}
           onPrefilledHandled={() => setBuilderPrefill(null)}
         />
-      ) : (
-        <ServiceabilityView jumpToBuilder={jumpToBuilder} />
       )}
+      {activeTab === 'serv' && <ServiceabilityView jumpToBuilder={jumpToBuilder} />}
+      {activeTab === 'search' && <SearchView jumpToBuilder={jumpToBuilder} />}
     </div>
   )
 }

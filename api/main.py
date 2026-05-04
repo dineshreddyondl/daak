@@ -156,14 +156,331 @@ def list_sub_districts(state: str = Query(...), district: str = Query(...)):
 
 @app.get("/api/villages")
 def list_villages(state: str = Query(...), district: str = Query(...),
-                  sub_district: str = Query(...)):
-    rows = fetch_all("""
-        SELECT DISTINCT village FROM geographic_hierarchy
-        WHERE state = %s AND district = %s AND sub_district = %s
-          AND village IS NOT NULL AND village != ''
-        ORDER BY village
-    """, (state, district, sub_district))
+                  sub_district: Optional[str] = Query(None)):
+    if sub_district:
+        rows = fetch_all("""
+            SELECT DISTINCT village FROM geographic_hierarchy
+            WHERE state = %s AND district = %s AND sub_district = %s
+              AND village IS NOT NULL AND village != ''
+            ORDER BY village
+        """, (state, district, sub_district))
+    else:
+        rows = fetch_all("""
+            SELECT DISTINCT village FROM geographic_hierarchy
+            WHERE state = %s AND district = %s
+              AND village IS NOT NULL AND village != ''
+            ORDER BY village
+        """, (state, district))
     return [r["village"] for r in rows]
+
+
+@app.get("/api/search")
+def search(
+    q: str = Query(..., min_length=1, max_length=100, description="Search query"),
+    types: str = Query(
+        "district,sub_district,village,pincode",
+        description="Comma-separated entity types to include"
+    ),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """
+    Mixed-type search across districts, sub-districts, villages, and pincodes.
+
+    Ranking (lower rank_score = better match):
+      0 = exact match (case-insensitive)
+      1 = prefix match
+      2 = contains match
+
+    Results are ordered by rank, then by entity type
+    (district > sub_district > village > pincode), then alphabetically.
+    """
+    q_clean = q.strip()
+    q_lower = q_clean.lower()
+
+    # Parse and validate types filter
+    allowed = {"district", "sub_district", "village", "pincode"}
+    requested = sorted({t.strip() for t in types.split(",") if t.strip()} & allowed)
+    if not requested:
+        return {"query": q_clean, "count": 0, "results": []}
+
+    types_placeholder = ",".join(["%s"] * len(requested))
+
+    # Pincode prefix matches only make sense for numeric queries
+    is_numeric = q_clean.isdigit()
+    pincode_clause = (
+        "(entity_type = 'pincode' AND pincode LIKE %s)"
+        if is_numeric else "FALSE"
+    )
+
+    sql = """
+        SELECT
+            entity_type,
+            name,
+            state,
+            district,
+            sub_district,
+            pincode,
+            centroid_lat,
+            centroid_lng,
+            metadata,
+            CASE
+                WHEN name_lower = %s THEN 0
+                WHEN name_lower LIKE %s THEN 1
+                ELSE 2
+            END AS rank_score,
+            CASE entity_type
+                WHEN 'district'     THEN 0
+                WHEN 'sub_district' THEN 1
+                WHEN 'village'      THEN 2
+                WHEN 'pincode'      THEN 3
+            END AS type_priority
+        FROM search_index
+        WHERE entity_type IN ({types_placeholder})
+          AND (
+            name_lower ILIKE %s
+            OR {pincode_clause}
+          )
+        ORDER BY rank_score ASC, type_priority ASC, name ASC
+        LIMIT %s
+    """.format(
+        types_placeholder=types_placeholder,
+        pincode_clause=pincode_clause,
+    )
+
+    params = [q_lower, q_lower + "%"]      # rank_score CASE
+    params.extend(requested)               # IN (...) types
+    params.append("%" + q_lower + "%")     # name ILIKE
+    if is_numeric:
+        params.append(q_clean + "%")       # pincode LIKE
+    params.append(limit)
+
+    rows = fetch_all(sql, tuple(params))
+
+    # Shape for frontend: build parent_path, drop ranking-only fields
+    for r in rows:
+        parts = []
+        if r["entity_type"] in ("sub_district", "village", "pincode"):
+            if r.get("state"):
+                parts.append(r["state"])
+            if r.get("district"):
+                parts.append(r["district"])
+        if r["entity_type"] == "village" and r.get("sub_district"):
+            parts.append(r["sub_district"])
+        r["parent_path"] = " · ".join(parts) if parts else None
+        r.pop("rank_score", None)
+        r.pop("type_priority", None)
+
+    return {
+        "query": q_clean,
+        "count": len(rows),
+        "results": rows,
+    }
+
+
+# ─── Bulk lookup ──────────────────────────────────────────────────────────────
+
+BULK_MAX_NAMES = 500
+
+
+class BulkSearchIn(BaseModel):
+    names: list[str] = Field(..., min_length=1, max_length=BULK_MAX_NAMES)
+    type_override: Optional[str] = Field(
+        None,
+        description="Force a single entity_type for all names. None = auto-detect.",
+    )
+
+
+def _bulk_search_one(name: str, type_override: Optional[str]) -> dict:
+    """
+    Look up one name, return best match + up to 5 alternatives + confidence.
+    Returns a dict shaped for the bulk results table.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return _na_row(name)
+
+    q_lower = raw.lower()
+
+    # Decide which entity_types to search
+    if type_override and type_override in {"district", "sub_district", "village", "pincode"}:
+        types = [type_override]
+    else:
+        # Auto-detect: numeric → pincode only, otherwise all types
+        types = ["pincode"] if raw.isdigit() else ["district", "sub_district", "village", "pincode"]
+
+    types_placeholder = ",".join(["%s"] * len(types))
+    is_numeric = raw.isdigit()
+    pincode_clause = (
+        "(entity_type = 'pincode' AND pincode LIKE %s)"
+        if is_numeric else "FALSE"
+    )
+
+    sql = """
+        SELECT
+            entity_type, name, state, district, sub_district, pincode,
+            centroid_lat, centroid_lng, metadata,
+            CASE
+                WHEN name_lower = %s THEN 0
+                WHEN name_lower LIKE %s THEN 1
+                ELSE 2
+            END AS rank_score,
+            CASE entity_type
+                WHEN 'district'     THEN 0
+                WHEN 'sub_district' THEN 1
+                WHEN 'village'      THEN 2
+                WHEN 'pincode'      THEN 3
+            END AS type_priority
+        FROM search_index
+        WHERE entity_type IN ({types_placeholder})
+          AND (
+            name_lower ILIKE %s
+            OR {pincode_clause}
+          )
+        ORDER BY rank_score ASC, type_priority ASC, name ASC
+        LIMIT 6
+    """.format(
+        types_placeholder=types_placeholder,
+        pincode_clause=pincode_clause,
+    )
+
+    params = [q_lower, q_lower + "%"]
+    params.extend(types)
+    params.append("%" + q_lower + "%")
+    if is_numeric:
+        params.append(raw + "%")
+
+    rows = fetch_all(sql, tuple(params))
+
+    if not rows:
+        return _na_row(name)
+
+    best = rows[0]
+    confidence = {0: "exact", 1: "prefix", 2: "partial"}.get(best["rank_score"], "partial")
+
+    def _shape(r: dict) -> dict:
+        return {
+            "entity_type": r["entity_type"],
+            "name": r["name"],
+            "state": r["state"],
+            "district": r["district"],
+            "sub_district": r["sub_district"],
+            "pincode": r["pincode"],
+        }
+
+    alternatives = [_shape(r) for r in rows[1:]]
+    return {
+        "input": name,
+        "status": "matched",
+        "confidence": confidence,
+        "best_match": _shape(best),
+        "alternatives": alternatives,
+    }
+
+
+def _na_row(name: str) -> dict:
+    return {
+        "input": name,
+        "status": "not_found",
+        "confidence": "none",
+        "best_match": {
+            "entity_type": "NA",
+            "name": "NA",
+            "state": "NA",
+            "district": "NA",
+            "sub_district": "NA",
+            "pincode": "NA",
+        },
+        "alternatives": [],
+    }
+
+
+@app.post("/api/search/bulk")
+def search_bulk(body: BulkSearchIn):
+    """
+    Look up many names at once. Cap at 500.
+    Returns one row per input name, with best match + alternatives.
+    """
+    type_override = body.type_override
+    if type_override and type_override not in {"district", "sub_district", "village", "pincode"}:
+        raise HTTPException(400, f"Invalid type_override: {type_override}")
+
+    results = [_bulk_search_one(n, type_override) for n in body.names]
+
+    matched = sum(1 for r in results if r["status"] == "matched")
+    return {
+        "count": len(results),
+        "matched": matched,
+        "not_found": len(results) - matched,
+        "results": results,
+    }
+
+
+@app.post("/api/search/bulk/export")
+def search_bulk_export(body: BulkSearchIn):
+    """
+    Same input as /api/search/bulk but returns an .xlsx file directly.
+    Used by the frontend's 'Download as XLSX' button.
+    """
+    type_override = body.type_override
+    results = [_bulk_search_one(n, type_override) for n in body.names]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Bulk Lookup"
+
+    headers = [
+        "#", "Input", "Status", "Confidence",
+        "Type", "Matched Name", "State", "District", "Sub-district", "Pincode",
+        "Alternatives Count",
+    ]
+    ws.append(headers)
+
+    for i, r in enumerate(results, start=1):
+        bm = r["best_match"]
+        ws.append([
+            i,
+            r["input"],
+            r["status"],
+            r["confidence"],
+            bm.get("entity_type", "NA"),
+            bm.get("name", "NA"),
+            bm.get("state", "NA"),
+            bm.get("district", "NA"),
+            bm.get("sub_district", "NA") if bm.get("sub_district") else "NA",
+            bm.get("pincode", "NA") if bm.get("pincode") else "NA",
+            len(r.get("alternatives", [])),
+        ])
+
+    # Optional second sheet listing alternatives, only for rows that have them
+    alt_sheet = wb.create_sheet("Alternatives")
+    alt_sheet.append([
+        "Row #", "Input", "Type", "Name", "State", "District", "Sub-district", "Pincode",
+    ])
+    for i, r in enumerate(results, start=1):
+        for alt in r.get("alternatives", []):
+            alt_sheet.append([
+                i,
+                r["input"],
+                alt.get("entity_type", "NA"),
+                alt.get("name", "NA"),
+                alt.get("state", "NA"),
+                alt.get("district", "NA"),
+                alt.get("sub_district", "NA") if alt.get("sub_district") else "NA",
+                alt.get("pincode", "NA") if alt.get("pincode") else "NA",
+            ])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="daak_bulk_lookup_{ts}.xlsx"',
+        },
+    )
 
 
 @app.get("/api/district/stats")
