@@ -718,6 +718,32 @@ function ServiceabilityView({ jumpToBuilder }) {
   function downloadDrafts()    { window.location.href = `${API_BASE}/api/export/drafts` }
   function downloadFinalized() { window.location.href = `${API_BASE}/api/export/finalized` }
 
+  async function deleteDistrict(d) {
+    const isFinalized = d.status === 'FINALIZED'
+    const finalizedNote = isFinalized
+      ? '\n\n⚠ This district is FINALIZED. Deleting will allow it to be re-built from scratch in the Builder.'
+      : ''
+    const msg =
+      `Delete ${d.district}, ${d.state}?\n\n` +
+      `This will remove ${d.hub_count} hub${d.hub_count === 1 ? '' : 's'} and ` +
+      `${(d.active_pincodes || 0) + (d.excluded_pincodes || 0)} pincode coverage row${(d.active_pincodes + d.excluded_pincodes) === 1 ? '' : 's'}.\n\n` +
+      `Master data (pincodes, villages, polygons) is NOT affected.${finalizedNote}\n\n` +
+      `This action cannot be undone.`
+
+    if (!confirm(msg)) return
+
+    try {
+      const res = await api(
+        `/api/district/${encodeURIComponent(d.state)}/${encodeURIComponent(d.district)}`,
+        { method: 'DELETE' }
+      )
+      // Refresh the table
+      await loadOverview()
+    } catch (e) {
+      setError(`Delete failed: ${e.message}`)
+    }
+  }
+
   const totalDistricts = summary?.total_districts ?? 0
   const draftDistricts = summary?.draft_districts ?? 0
   const finalDistricts = summary?.finalized_districts ?? 0
@@ -828,6 +854,7 @@ function ServiceabilityView({ jumpToBuilder }) {
                     <div className="row-actions">
                       <button className="action-primary" onClick={() => openDetail(d.state, d.district)}>View</button>
                       <button className="action-export" onClick={() => downloadDistrict(d.district)}>📥</button>
+                      <button className="action-delete" onClick={() => deleteDistrict(d)} title="Delete district">🗑</button>
                     </div>
                   </td>
                 </tr>
@@ -1086,9 +1113,15 @@ function DetailPanel({ result, onSelect, jumpToBuilder }) {
   const mapRef = useRef(null)
   const mapInstance = useRef(null)
   const markerRef = useRef(null)
+  const polygonRef = useRef(null)
+
+  // Per-district polygon cache so we don't refetch when clicking within same district
+  const polygonCacheRef = useRef(new Map())
 
   useEffect(() => {
     if (!hasLatLng || !mapRef.current) return
+
+    // Init or recenter map
     if (!mapInstance.current) {
       mapInstance.current = new window.google.maps.Map(mapRef.current, {
         center: { lat: result.centroid_lat, lng: result.centroid_lng },
@@ -1101,24 +1134,72 @@ function DetailPanel({ result, onSelect, jumpToBuilder }) {
       mapInstance.current.setCenter({ lat: result.centroid_lat, lng: result.centroid_lng })
       mapInstance.current.setZoom(12)
     }
-    if (markerRef.current) markerRef.current.setMap(null)
+
+    // Clear previous overlays
+    if (markerRef.current) { markerRef.current.setMap(null); markerRef.current = null }
+    if (polygonRef.current) { polygonRef.current.setMap(null); polygonRef.current = null }
+
+    // Always place the centroid dot
     markerRef.current = new window.google.maps.Marker({
       position: { lat: result.centroid_lat, lng: result.centroid_lng },
       map: mapInstance.current,
       icon: {
         path: window.google.maps.SymbolPath.CIRCLE, scale: 8,
-        fillColor: '#10b981', fillOpacity: 0.7,
+        fillColor: '#10b981', fillOpacity: 0.9,
         strokeColor: '#065f46', strokeWeight: 2,
       },
       title: result.name,
+      zIndex: 1000,
     })
-  }, [result.centroid_lat, result.centroid_lng])
 
-  // Reset map instance when switching to non-pincode results
+    // For pincode results, also draw the polygon (fetched lazily)
+    if (isPincode && result.district) {
+      let cancelled = false
+      const cache = polygonCacheRef.current
+      const districtKey = `${result.state}|${result.district}`
+
+      const fetchPincodes = cache.has(districtKey)
+        ? Promise.resolve(cache.get(districtKey))
+        : api(`/api/district/pincodes?district=${encodeURIComponent(result.district)}`)
+            .then(rows => { cache.set(districtKey, rows); return rows })
+
+      fetchPincodes.then(rows => {
+        if (cancelled) return
+        const match = rows.find(r => String(r.pincode) === String(result.pincode))
+        if (!match || !match.boundary_geojson) return
+
+        const boundary = match.boundary_geojson
+        if (boundary.type !== 'Polygon') return
+
+        const paths = boundary.coordinates[0].map(([lng, lat]) => ({ lat, lng }))
+        polygonRef.current = new window.google.maps.Polygon({
+          paths,
+          strokeColor: '#065f46',
+          strokeWeight: 2,
+          strokeOpacity: 0.9,
+          fillColor: '#10b981',
+          fillOpacity: 0.25,
+          map: mapInstance.current,
+          clickable: false,
+          zIndex: 100,
+        })
+
+        // Fit map to polygon bounds for a clean view
+        const bounds = new window.google.maps.LatLngBounds()
+        paths.forEach(p => bounds.extend(p))
+        mapInstance.current.fitBounds(bounds)
+      }).catch(() => { /* swallow — dot is enough fallback */ })
+
+      return () => { cancelled = true }
+    }
+  }, [result.centroid_lat, result.centroid_lng, result.pincode, result.district, isPincode])
+
+  // Reset map state when leaving pincode results
   useEffect(() => {
     if (!hasLatLng) {
       mapInstance.current = null
       if (markerRef.current) { markerRef.current.setMap(null); markerRef.current = null }
+      if (polygonRef.current) { polygonRef.current.setMap(null); polygonRef.current = null }
     }
   }, [hasLatLng])
 

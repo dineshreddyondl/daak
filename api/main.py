@@ -691,6 +691,72 @@ def finalize_district(state: str, district: str, body: FinalizeIn):
     return {"district": district, "status": "FINALIZED"}
 
 
+@app.delete("/api/district/{state}/{district}")
+def delete_district(state: str, district: str):
+    """
+    Hard-delete a district's working data: status, hubs, and coverage.
+
+    This ONLY removes ops-created rows from:
+      - district_coverage  (pincodes assigned to this district's hubs)
+      - district_hubs      (hubs ops placed)
+      - district_status    (DRAFT / FINALIZED tracking)
+
+    Master data is NEVER touched: pincodes_master, geographic_hierarchy,
+    and search_index remain intact. After delete the district disappears
+    from Serviceability and the user can start over in Builder.
+
+    Allowed for both DRAFT and FINALIZED districts.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Confirm something exists to delete
+            cur.execute(
+                "SELECT status FROM district_status WHERE district = %s AND state = %s",
+                (district, state),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(404, f"District '{district}' not found in {state}")
+
+            # Count what's about to go away (for the response)
+            cur.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM district_hubs
+                       WHERE district = %s AND state = %s) AS hub_count,
+                    (SELECT COUNT(*) FROM district_coverage c
+                       JOIN district_hubs h ON h.id = c.hub_id
+                       WHERE h.district = %s AND h.state = %s) AS coverage_count
+            """, (district, state, district, state))
+            counts = cur.fetchone()
+
+            # Delete in order: coverage -> hubs -> status
+            # (district_coverage has a FK to district_hubs)
+            cur.execute("""
+                DELETE FROM district_coverage
+                WHERE hub_id IN (
+                    SELECT id FROM district_hubs
+                    WHERE district = %s AND state = %s
+                )
+            """, (district, state))
+
+            cur.execute(
+                "DELETE FROM district_hubs WHERE district = %s AND state = %s",
+                (district, state),
+            )
+
+            cur.execute(
+                "DELETE FROM district_status WHERE district = %s AND state = %s",
+                (district, state),
+            )
+
+    return {
+        "deleted": True,
+        "district": district,
+        "state": state,
+        "removed_hubs": counts["hub_count"],
+        "removed_coverage_rows": counts["coverage_count"],
+    }
+
+
 @app.get("/api/serviceability/overview")
 def serviceability_overview(state: Optional[str] = None,
                             status: Optional[str] = None,

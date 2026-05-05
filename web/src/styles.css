@@ -378,6 +378,8 @@
   .row-actions button:hover { background: var(--panel-2); border-color: var(--border-2); }
   .row-actions button.action-primary { color: var(--primary); }
   .row-actions button.action-export { color: var(--success); }
+  .row-actions button.action-delete { color: var(--danger); }
+  .row-actions button.action-delete:hover { background: var(--danger-bg); border-color: var(--danger-bd); }
   
   .bulk-bar {
     display: flex; gap: 12px;
