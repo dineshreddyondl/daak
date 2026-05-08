@@ -84,6 +84,7 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
   const autocompleteRef = useRef(null)
   const searchInputRef = useRef(null)
   const districtBoundsRef = useRef(null)
+  const centroidMarker = useRef(null)
 
   // Pre-select state/district/sub_district/village from Search or Serviceability
   useEffect(() => {
@@ -133,6 +134,44 @@ function BuilderView({ openServiceability, prefilled, onPrefilledHandled }) {
       setStatusOk(`Loaded ${pc.length} pincodes for ${district}.`)
       fitMapToBounds(pc)
     }).catch(e => setStatusErr(e.message))
+  }, [state, district])
+
+  // Fetch the district HQ centroid (geocoded once, stored in DB) and place a
+  // permanent marker on the Builder map. Independent of the pincode load.
+  useEffect(() => {
+    // Clear any existing centroid marker first
+    if (centroidMarker.current) {
+      centroidMarker.current.setMap(null)
+      centroidMarker.current = null
+    }
+    if (!state || !district || !mapInstance.current) return
+
+    let cancelled = false
+    api(`/api/district_centroid?state=${encodeURIComponent(state)}&district=${encodeURIComponent(district)}`)
+      .then(c => {
+        if (cancelled || !mapInstance.current) return
+        if (centroidMarker.current) {
+          centroidMarker.current.setMap(null)
+          centroidMarker.current = null
+        }
+        centroidMarker.current = new window.google.maps.Marker({
+          position: { lat: c.lat, lng: c.lng },
+          map: mapInstance.current,
+          icon: {
+            path: 'M 0,-9 2.6,-2.8 9.5,-2.8 4,1.1 6.1,7.5 0,3.6 -6.1,7.5 -4,1.1 -9.5,-2.8 -2.6,-2.8 z',
+            fillColor: '#7c3aed',
+            fillOpacity: 1,
+            strokeColor: '#ffffff',
+            strokeWeight: 1.5,
+            scale: 1.2,
+          },
+          title: `District HQ: ${c.district}, ${c.state}\n${c.formatted_address || ''}`,
+          zIndex: 3000,
+        })
+      })
+      .catch(() => { /* 404 means no centroid stored — silent */ })
+
+    return () => { cancelled = true }
   }, [state, district])
 
   useEffect(() => {
@@ -1673,6 +1712,598 @@ function BulkLookup() {
 
 
 // ============================================================================
+// LANES VIEW — district-to-district lane identification (v2)
+// Single autocomplete origin · flat list · expandable to sub-district + village
+// ============================================================================
+
+function LanesView({ jumpToBuilder }) {
+  const [origins, setOrigins] = useState([])           // all districts with centroids
+  const [originsLoaded, setOriginsLoaded] = useState(false)
+  const [originPicked, setOriginPicked] = useState(null) // { state, district, lat, lng }
+
+  // Combo dropdown state
+  const [comboOpen, setComboOpen] = useState(false)
+  const [comboQuery, setComboQuery] = useState('')
+
+  const [maxKm, setMaxKm] = useState(800)
+  const [minKm, setMinKm] = useState(150)
+  const [data, setData] = useState(null)               // /api/lanes/from-district result
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [filter, setFilter] = useState('')             // results filter input
+  const [exporting, setExporting] = useState(false)
+  const [expanded, setExpanded] = useState({})         // 'state|district' -> bool
+  const [subData, setSubData] = useState({})           // 'state|district' -> { subs:[], loading }
+  const [subExpanded, setSubExpanded] = useState({})   // 'state|district|sub' -> bool
+  const [villageData, setVillageData] = useState({})   // 'state|district|sub' -> { villages:[], loading }
+  const [showMap, setShowMap] = useState(false)        // map toggle
+
+  const comboRef = useRef(null)
+  const comboInputRef = useRef(null)
+  const mapRef = useRef(null)
+  const mapInstance = useRef(null)
+  const mapOverlays = useRef([])
+
+  // Load origins list once
+  useEffect(() => {
+    api('/api/lanes/origins')
+      .then(rows => { setOrigins(rows); setOriginsLoaded(true) })
+      .catch(e => setError(`Failed to load districts: ${e.message}`))
+  }, [])
+
+  // Combo dropdown items.
+  // - When the search box is empty: first 30 districts + a "more" tail line
+  // - When the user types: ranked filter (district startsWith → contains → state contains)
+  // We compute matches over the whole list so the meta count is accurate.
+  const COMBO_VISIBLE_WHEN_EMPTY = 30
+  const comboData = (() => {
+    const q = comboQuery.trim().toLowerCase()
+    if (!q) {
+      return {
+        matches: origins.slice(0, COMBO_VISIBLE_WHEN_EMPTY),
+        totalMatched: origins.length,
+        truncated: origins.length > COMBO_VISIBLE_WHEN_EMPTY,
+        query: '',
+      }
+    }
+    const out = []
+    for (const o of origins) {
+      const dl = (o.district || '').toLowerCase()
+      const sl = (o.state || '').toLowerCase()
+      if (dl.startsWith(q)) out.push({ ...o, _rank: 0 })
+      else if (dl.includes(q)) out.push({ ...o, _rank: 1 })
+      else if (sl.includes(q)) out.push({ ...o, _rank: 2 })
+    }
+    out.sort((a, b) => a._rank - b._rank || a.district.localeCompare(b.district))
+    return {
+      matches: out,
+      totalMatched: out.length,
+      truncated: false,
+      query: q,
+    }
+  })()
+
+  function pickOrigin(o) {
+    setOriginPicked({ state: o.state, district: o.district })
+    setComboQuery('')
+    setComboOpen(false)
+  }
+
+  function clearOrigin() {
+    setOriginPicked(null)
+    setComboQuery('')
+    // keep open for re-pick
+  }
+
+  // Close on click-outside or Escape
+  useEffect(() => {
+    function onDocClick(e) {
+      if (comboRef.current && !comboRef.current.contains(e.target)) {
+        setComboOpen(false)
+      }
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') setComboOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDocClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [])
+
+  // Auto-focus the search input when the dropdown opens
+  useEffect(() => {
+    if (comboOpen && comboInputRef.current) {
+      comboInputRef.current.focus()
+    }
+  }, [comboOpen])
+
+  // Render district name with matched substring highlighted
+  function highlight(text, query) {
+    if (!query) return text
+    const lower = text.toLowerCase()
+    const idx = lower.indexOf(query)
+    if (idx < 0) return text
+    return (
+      <>
+        {text.slice(0, idx)}
+        <mark className="combo-hl">{text.slice(idx, idx + query.length)}</mark>
+        {text.slice(idx + query.length)}
+      </>
+    )
+  }
+
+  // Map: render origin pin + destination dots + lines when map is shown and data ready
+  useEffect(() => {
+    if (!showMap || !data || !mapRef.current) return
+
+    if (!mapInstance.current) {
+      mapInstance.current = new window.google.maps.Map(mapRef.current, {
+        center: { lat: data.origin.lat, lng: data.origin.lng },
+        zoom: 6,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: true,
+      })
+    }
+    const map = mapInstance.current
+
+    // Clear previous overlays
+    mapOverlays.current.forEach(o => o.setMap(null))
+    mapOverlays.current = []
+
+    const origin = { lat: data.origin.lat, lng: data.origin.lng }
+
+    // Origin: red pin, larger
+    mapOverlays.current.push(new window.google.maps.Marker({
+      position: origin,
+      map,
+      icon: {
+        path: window.google.maps.SymbolPath.CIRCLE, scale: 10,
+        fillColor: '#dc2626', fillOpacity: 0.95,
+        strokeColor: '#fff', strokeWeight: 2,
+      },
+      title: `Origin: ${data.origin.district}, ${data.origin.state}`,
+      zIndex: 2000,
+    }))
+
+    // Color by distance bucket
+    function colorFor(distKm) {
+      if (distKm <= 100) return '#10b981'   // green
+      if (distKm <= 250) return '#3b82f6'   // blue
+      if (distKm <= 500) return '#f59e0b'   // amber
+      return '#ef4444'                       // red
+    }
+
+    const bounds = new window.google.maps.LatLngBounds()
+    bounds.extend(origin)
+
+    for (const d of data.destinations) {
+      const dest = { lat: d.lat, lng: d.lng }
+      bounds.extend(dest)
+      const color = colorFor(d.distance_km)
+
+      mapOverlays.current.push(new window.google.maps.Polyline({
+        path: [origin, dest],
+        strokeColor: color, strokeWeight: 1.5, strokeOpacity: 0.4,
+        map, clickable: false,
+      }))
+      mapOverlays.current.push(new window.google.maps.Marker({
+        position: dest,
+        map,
+        icon: {
+          path: window.google.maps.SymbolPath.CIRCLE, scale: 5,
+          fillColor: color, fillOpacity: 0.9,
+          strokeColor: '#fff', strokeWeight: 1.5,
+        },
+        title: `${d.district}, ${d.state} — ${d.distance_km} km`,
+        zIndex: 1000,
+      }))
+    }
+
+    if (!bounds.isEmpty()) map.fitBounds(bounds)
+  }, [showMap, data])
+
+  // Cleanup overlays when leaving the tab
+  useEffect(() => {
+    return () => {
+      mapOverlays.current.forEach(o => o.setMap(null))
+      mapOverlays.current = []
+    }
+  }, [])
+
+  async function runLookup() {
+    if (!originPicked) {
+      setError('Pick an origin district first.')
+      return
+    }
+    setLoading(true)
+    setError('')
+    setData(null)
+    setExpanded({}); setSubData({}); setSubExpanded({}); setVillageData({})
+    setFilter('')
+    try {
+      const params = new URLSearchParams({
+        state: originPicked.state,
+        district: originPicked.district,
+        min_km: String(minKm),
+        max_km: String(maxKm),
+      })
+      const res = await api(`/api/lanes/from-district?${params}`)
+      setData(res)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function downloadXlsx() {
+    if (!originPicked) return
+    setExporting(true)
+    try {
+      const params = new URLSearchParams({
+        state: originPicked.state,
+        district: originPicked.district,
+        min_km: String(minKm),
+        max_km: String(maxKm),
+      })
+      const res = await fetch(`${API_BASE}/api/lanes/from-district/export?${params}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      const safe = originPicked.district.replace(/[^a-zA-Z0-9]/g, '_')
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      a.href = url
+      a.download = `daak_lanes_from_${safe}_${ts}.xlsx`
+      document.body.appendChild(a); a.click(); document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`Export failed: ${e.message}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  function keyOf(d) { return `${d.state}|${d.district}` }
+  function subKeyOf(d, sub) { return `${d.state}|${d.district}|${sub}` }
+
+  async function toggleDistrict(d) {
+    const k = keyOf(d)
+    const willOpen = !expanded[k]
+    setExpanded(s => ({ ...s, [k]: willOpen }))
+    if (willOpen && !subData[k]) {
+      setSubData(s => ({ ...s, [k]: { loading: true, subs: [] } }))
+      try {
+        const subs = await api(
+          `/api/sub_districts?state=${encodeURIComponent(d.state)}&district=${encodeURIComponent(d.district)}`
+        )
+        setSubData(s => ({ ...s, [k]: { loading: false, subs } }))
+      } catch (e) {
+        setSubData(s => ({ ...s, [k]: { loading: false, subs: [], error: e.message } }))
+      }
+    }
+  }
+
+  async function toggleSubDistrict(d, sub) {
+    const sk = subKeyOf(d, sub)
+    const willOpen = !subExpanded[sk]
+    setSubExpanded(s => ({ ...s, [sk]: willOpen }))
+    if (willOpen && !villageData[sk]) {
+      setVillageData(s => ({ ...s, [sk]: { loading: true, villages: [] } }))
+      try {
+        const villages = await api(
+          `/api/villages?state=${encodeURIComponent(d.state)}` +
+          `&district=${encodeURIComponent(d.district)}` +
+          `&sub_district=${encodeURIComponent(sub)}`
+        )
+        setVillageData(s => ({ ...s, [sk]: { loading: false, villages } }))
+      } catch (e) {
+        setVillageData(s => ({ ...s, [sk]: { loading: false, villages: [], error: e.message } }))
+      }
+    }
+  }
+
+  // Filter destinations by user's text — match on district name, sub-district names
+  // (only if expanded/loaded), or village names (only if expanded/loaded).
+  // We match destinations where ANY level contains the filter substring.
+  const destinations = data?.destinations || []
+  const filterLower = filter.trim().toLowerCase()
+
+  function rowMatchesFilter(d) {
+    if (!filterLower) return true
+    if (d.district.toLowerCase().includes(filterLower)) return true
+    if (d.state.toLowerCase().includes(filterLower)) return true
+    const k = keyOf(d)
+    const subs = (subData[k]?.subs) || []
+    if (subs.some(s => s.toLowerCase().includes(filterLower))) return true
+    for (const sub of subs) {
+      const sk = subKeyOf(d, sub)
+      const villages = (villageData[sk]?.villages) || []
+      if (villages.some(v => v.toLowerCase().includes(filterLower))) return true
+    }
+    return false
+  }
+
+  const visibleDests = destinations.filter(rowMatchesFilter)
+
+  return (
+    <main className="lanes-page">
+      <div className="serv-header">
+        <div className="serv-title">Lane identifier</div>
+        <div className="serv-sub">
+          Pick an origin district. See all destinations within range, sorted by
+          straight-line distance. Click any destination to expand sub-districts
+          and villages.
+        </div>
+      </div>
+
+      {error && <div className="serv-error">{error}</div>}
+
+      <div className="lanes-controls">
+        <div className="combo" ref={comboRef}>
+          <button type="button"
+                  className={`combo-field ${originPicked ? 'has-value' : ''}`}
+                  onClick={() => setComboOpen(o => !o)}
+                  disabled={!originsLoaded}>
+            <span className="combo-icon">⌕</span>
+            <span className="combo-value">
+              {originPicked
+                ? <>
+                    <b>{originPicked.district}</b>
+                    <span className="combo-value-state"> · {originPicked.state}</span>
+                  </>
+                : (originsLoaded ? 'Select origin district' : 'Loading districts…')}
+            </span>
+            {originPicked && (
+              <span className="combo-clear"
+                    onClick={(e) => { e.stopPropagation(); clearOrigin() }}
+                    title="Clear">×</span>
+            )}
+            <span className={`combo-chev ${comboOpen ? 'open' : ''}`}>▾</span>
+          </button>
+
+          {comboOpen && (
+            <div className="combo-panel">
+              <div className="combo-search">
+                <span className="combo-search-icon">⌕</span>
+                <input
+                  ref={comboInputRef}
+                  className="combo-search-input"
+                  placeholder={`Type to search ${origins.length} districts…`}
+                  value={comboQuery}
+                  onChange={e => setComboQuery(e.target.value)}
+                />
+                {comboQuery && (
+                  <span className="combo-search-clear"
+                        onClick={() => setComboQuery('')}
+                        title="Clear search">×</span>
+                )}
+              </div>
+              <div className="combo-meta">
+                {comboQuery
+                  ? (comboData.totalMatched === 0
+                      ? 'No matches'
+                      : `${comboData.totalMatched} match${comboData.totalMatched === 1 ? '' : 'es'}`)
+                  : `All ${origins.length} districts · type to filter`}
+              </div>
+              <div className="combo-list">
+                {comboData.matches.length === 0 ? (
+                  <div className="combo-empty">No districts match "{comboQuery}"</div>
+                ) : (
+                  <>
+                    {comboData.matches.map(o => (
+                      <div key={`${o.state}|${o.district}`}
+                           className="combo-opt"
+                           onMouseDown={() => pickOrigin(o)}>
+                        <span className="combo-opt-d">
+                          {highlight(o.district, comboData.query)}
+                        </span>
+                        <span className="combo-opt-s">
+                          {highlight(o.state, comboData.query)}
+                        </span>
+                      </div>
+                    ))}
+                    {comboData.truncated && (
+                      <div className="combo-tail">
+                        … {origins.length - COMBO_VISIBLE_WHEN_EMPTY} more, type to filter
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <span className="lanes-control-label">Min</span>
+        <input type="number" className="lanes-maxkm"
+               min="0" max="3000" step="50"
+               value={minKm}
+               onChange={e => setMinKm(Math.max(0, parseInt(e.target.value, 10) || 0))} />
+        <span className="lanes-control-label">Max</span>
+        <input type="number" className="lanes-maxkm"
+               min="50" max="3000" step="50"
+               value={maxKm}
+               onChange={e => setMaxKm(parseInt(e.target.value, 10) || 800)} />
+        <span className="lanes-control-label">km</span>
+        <button className="lanes-go-btn"
+                onClick={runLookup}
+                disabled={!originPicked || loading || minKm > maxKm}>
+          {loading ? 'Loading…' : 'Find lanes'}
+        </button>
+      </div>
+
+      {!data && !loading && (
+        <div className="serv-empty">
+          <div className="ico">🛣️</div>
+          Pick a district to begin.
+        </div>
+      )}
+
+      {data && (
+        <>
+          <div className="serv-stats" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+            <div className="serv-stat-card highlight">
+              <div className="label">Origin</div>
+              <div className="value" style={{ fontSize: 16 }}>{data.origin.district}</div>
+              <div className="delta">{data.origin.state}</div>
+            </div>
+            <div className="serv-stat-card">
+              <div className="label">Reachable</div>
+              <div className="value">{data.total}</div>
+              <div className="delta">
+                {(data.min_km != null && data.min_km > 0)
+                  ? `between ${data.min_km} and ${data.max_km} km`
+                  : `within ${data.max_km} km`}
+              </div>
+            </div>
+            <div className="serv-stat-card warn">
+              <div className="label">Method</div>
+              <div className="value" style={{ fontSize: 14 }}>Haversine</div>
+              <div className="delta">road km ≈ × {data.notes.road_multiplier}</div>
+            </div>
+          </div>
+
+          <div className="lanes-toolbar">
+            <div className="lanes-filter-wrap">
+              <span className="lanes-filter-icon">⌕</span>
+              <input
+                type="text"
+                className="lanes-filter-input"
+                placeholder="Filter results · district, state, sub-district, village…"
+                value={filter}
+                onChange={e => setFilter(e.target.value)}
+              />
+            </div>
+            <div className="lanes-count">
+              Showing <b>{visibleDests.length}</b> of {destinations.length}
+            </div>
+            <button className={`lanes-map-toggle ${showMap ? 'active' : ''}`}
+                    onClick={() => setShowMap(s => !s)}
+                    title="Toggle map view">
+              {showMap ? '✓ Map' : '◯ Map'}
+            </button>
+            <button className="lanes-download-btn"
+                    onClick={downloadXlsx}
+                    disabled={exporting || destinations.length === 0}>
+              {exporting ? 'Exporting…' : '↓ Download'}
+            </button>
+          </div>
+
+          {showMap && (
+            <div className="lanes-map-panel">
+              <div ref={mapRef} className="lanes-map-canvas" />
+            </div>
+          )}
+
+          <div className="lanes-list">
+            <div className="lanes-list-head">
+              <div></div>
+              <div>District</div>
+              <div>State</div>
+              <div>Coverage</div>
+              <div className="right">km</div>
+              <div className="right">~road km</div>
+            </div>
+
+            {visibleDests.length === 0 ? (
+              <div className="lanes-empty-state">
+                No destinations match "{filter}".
+                {filter && (
+                  <div style={{ marginTop: 6, fontSize: 11 }}>
+                    Tip: sub-district / village names match only when their parent
+                    row is expanded (data is loaded lazily).
+                  </div>
+                )}
+              </div>
+            ) : visibleDests.map(d => {
+              const k = keyOf(d)
+              const isOpen = !!expanded[k]
+              const subs = (subData[k]?.subs) || []
+              const subsLoading = subData[k]?.loading
+              const sdc = d.sub_district_count || 0
+              const vc  = d.village_count || 0
+              const hasChildren = sdc > 0 || vc > 0
+              return (
+                <div key={k} className={`lane-row ${isOpen ? 'expanded' : ''}`}>
+                  <div className="lane-row-body" onClick={() => toggleDistrict(d)}>
+                    <span className="lane-chev">▸</span>
+                    <div className="lane-district">{d.district}</div>
+                    <div className="lane-state">{d.state}</div>
+                    <div className="lane-counts">
+                      {hasChildren ? (
+                        <>
+                          <span className="lane-count-num">{sdc.toLocaleString()}</span>
+                          <span className="lane-count-lbl">sub-dist</span>
+                          <span className="lane-count-sep">·</span>
+                          <span className="lane-count-num">{vc.toLocaleString()}</span>
+                          <span className="lane-count-lbl">villages</span>
+                          {!isOpen && <span className="lane-count-hint">click to view</span>}
+                        </>
+                      ) : (
+                        <span className="lane-count-empty">no village data</span>
+                      )}
+                    </div>
+                    <div className="lane-km right">{d.distance_km}</div>
+                    <div className="lane-km right muted">{d.estimated_road_km}</div>
+                  </div>
+                  {isOpen && (
+                    <div className="lane-drawer">
+                      {subsLoading ? (
+                        <div className="lane-drawer-empty">Loading sub-districts…</div>
+                      ) : subs.length === 0 ? (
+                        <div className="lane-drawer-empty">No sub-districts found.</div>
+                      ) : (
+                        <>
+                          <div className="lane-drawer-label">{subs.length} sub-district{subs.length === 1 ? '' : 's'}</div>
+                          {subs.map(sub => {
+                            const sk = subKeyOf(d, sub)
+                            const subOpen = !!subExpanded[sk]
+                            const vd = villageData[sk]
+                            return (
+                              <div key={sk} className="sub-card">
+                                <div className="sub-card-head" onClick={() => toggleSubDistrict(d, sub)}>
+                                  <span className={`sub-chev ${subOpen ? 'open' : ''}`}>▸</span>
+                                  <div className="sub-name">{sub}</div>
+                                  {vd?.villages && (
+                                    <div className="sub-meta">{vd.villages.length} villages</div>
+                                  )}
+                                </div>
+                                {subOpen && (
+                                  <div className="sub-villages">
+                                    {vd?.loading ? (
+                                      <span className="muted">Loading villages…</span>
+                                    ) : (vd?.villages || []).length === 0 ? (
+                                      <span className="muted">No villages.</span>
+                                    ) : (
+                                      vd.villages.join(', ')
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
+    </main>
+  )
+}
+
+
+
+// ============================================================================
 // ROOT APP — header + tab routing + theme
 // ============================================================================
 
@@ -1745,6 +2376,10 @@ export default function App() {
                onClick={() => setActiveTab('search')}>
             Search
           </div>
+          <div className={`tab ${activeTab === 'lanes' ? 'active' : ''}`}
+               onClick={() => setActiveTab('lanes')}>
+            Lanes
+          </div>
         </div>
         <div className="spacer" />
         <button
@@ -1764,6 +2399,7 @@ export default function App() {
       )}
       {activeTab === 'serv' && <ServiceabilityView jumpToBuilder={jumpToBuilder} />}
       {activeTab === 'search' && <SearchView jumpToBuilder={jumpToBuilder} />}
+      {activeTab === 'lanes' && <LanesView jumpToBuilder={jumpToBuilder} />}
     </div>
   )
 }

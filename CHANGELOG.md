@@ -73,4 +73,13 @@ Aim for one bullet per shipped change. Group related small changes. Don't list i
 
 ## 2026-05-03
 
-...
+## 2026-05-08 — Lane Identifier
+
+- **New `Lanes` tab** — fourth tab. Pick an origin district from a custom combo dropdown (search inside the dropdown with match highlighting). See all destinations within a min/max distance band (default 150–800 km). Useful for shortlisting lanes when planning hubs.
+- **New `district_centroids` table** — one row per (state, district), populated once via Google Geocoding for 780 districts (UNION of `pincodes_master` + `geographic_hierarchy`). Stores lat/lng + bounding box + formatted address + place_id.
+- **Lane query response** — flat sorted list with per-district `sub_district_count` and `village_count` from a single `GROUP BY` on `geographic_hierarchy` (no N+1).
+- **Lanes UI** — filter-as-you-type across results, expandable rows showing sub-districts and villages (lazy loaded), optional map view with origin pin and destination dots, XLSX download with min/max in title row and as a column.
+- **Builder enhancement** — purple District HQ star marker on the Builder map (uses the centroid we already geocoded). Hover for full address. Visual reference only — does not pre-fill hub coordinates.
+- **API additions:** `GET /api/lanes/origins`, `GET /api/lanes/from-district?state=&district=&min_km=&max_km=`, `GET /api/lanes/from-district/export` (XLSX), `GET /api/district_centroid?state=&district=`.
+- **One-time scripts:** `backend/district_centroids_schema.sql`, `backend/load_district_centroids.py`.
+- **No master data touched.** `pincodes_master`, `geographic_hierarchy`, `search_index` all untouched. Lane Identifier is purely additive.

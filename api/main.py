@@ -483,6 +483,222 @@ def search_bulk_export(body: BulkSearchIn):
     )
 
 
+# ─── Lane Identifier ──────────────────────────────────────────────────────────
+
+# Multiplier from haversine (straight-line) to estimated road km.
+# Indian roads typically add 25-35% on top of straight-line; 1.3 is a reasonable mean.
+ROAD_KM_MULTIPLIER = 1.3
+
+
+@app.get("/api/lanes/origins")
+def list_lane_origins():
+    """
+    All districts available as origins/destinations for lane identification.
+    A district must have a centroid in district_centroids to be eligible.
+    Returned flat (no state filter); the frontend autocomplete handles search.
+    """
+    return fetch_all("""
+        SELECT state, district, lat, lng
+        FROM district_centroids
+        ORDER BY state, district
+    """)
+
+
+@app.get("/api/district_centroid")
+def get_district_centroid(state: str = Query(...), district: str = Query(...)):
+    """
+    Return the geocoded centroid for a single district. Used by Builder to show
+    a 'District HQ' marker on the map. Returns 404 if no centroid is stored
+    (e.g., district outside what load_district_centroids.py covered).
+    """
+    row = fetch_one("""
+        SELECT state, district, lat, lng,
+               bbox_ne_lat, bbox_ne_lng, bbox_sw_lat, bbox_sw_lng,
+               formatted_address
+        FROM district_centroids
+        WHERE state = %s AND district = %s
+    """, (state, district))
+    if row is None:
+        raise HTTPException(404, f"No centroid for {district}, {state}")
+    return row
+
+
+def _compute_destinations(state: str, district: str, min_km: float, max_km: float):
+    """
+    Shared helper for lanes endpoints — returns (origin, destinations) where
+    destinations is a flat list sorted by distance_km ascending.
+    Includes only districts where min_km <= distance <= max_km.
+
+    Each destination also carries `sub_district_count` and `village_count`
+    aggregated from geographic_hierarchy (0 for districts that exist only in
+    pincodes_master with no village data).
+    """
+    origin = fetch_one("""
+        SELECT state, district, lat, lng,
+               bbox_ne_lat, bbox_ne_lng, bbox_sw_lat, bbox_sw_lng,
+               formatted_address
+        FROM district_centroids
+        WHERE state = %s AND district = %s
+    """, (state, district))
+
+    if origin is None:
+        raise HTTPException(404,
+            f"No centroid for {district}, {state}. "
+            f"Run load_district_centroids.py to backfill.")
+
+    rows = fetch_all("""
+        SELECT state, district, lat, lng
+        FROM district_centroids
+        WHERE NOT (state = %s AND district = %s)
+    """, (state, district))
+
+    # Single aggregate query: sub-district + village counts per (state, district)
+    counts_rows = fetch_all("""
+        SELECT state, district,
+               COUNT(DISTINCT sub_district) AS sub_district_count,
+               COUNT(*)                     AS village_count
+        FROM geographic_hierarchy
+        WHERE state IS NOT NULL AND district IS NOT NULL
+        GROUP BY state, district
+    """)
+    counts_map = {(r["state"], r["district"]):
+                  (r["sub_district_count"], r["village_count"])
+                  for r in counts_rows}
+
+    destinations = []
+    for r in rows:
+        dist_km = haversine_km(origin["lat"], origin["lng"], r["lat"], r["lng"])
+        if dist_km < min_km or dist_km > max_km:
+            continue
+        sd_cnt, v_cnt = counts_map.get((r["state"], r["district"]), (0, 0))
+        destinations.append({
+            "state": r["state"],
+            "district": r["district"],
+            "lat": r["lat"],
+            "lng": r["lng"],
+            "distance_km":      round(dist_km, 1),
+            "estimated_road_km": round(dist_km * ROAD_KM_MULTIPLIER, 1),
+            "sub_district_count": sd_cnt,
+            "village_count":      v_cnt,
+        })
+
+    destinations.sort(key=lambda d: d["distance_km"])
+    return origin, destinations
+
+
+@app.get("/api/lanes/from-district")
+def lanes_from_district(
+    state: str = Query(...),
+    district: str = Query(...),
+    min_km: float = Query(150, ge=0, le=5000,
+                          description="Min straight-line distance (exclude near districts)"),
+    max_km: float = Query(800, gt=0, le=5000,
+                          description="Max straight-line distance to consider"),
+):
+    """
+    Given an origin district, return all destination districts where
+    min_km <= haversine distance <= max_km, sorted ascending by distance.
+
+    Uses district_centroids exclusively — no Google calls, no joins to
+    pincodes_master. Sub-millisecond.
+    """
+    if min_km > max_km:
+        raise HTTPException(400, f"min_km ({min_km}) must be <= max_km ({max_km})")
+
+    origin, destinations = _compute_destinations(state, district, min_km, max_km)
+    return {
+        "origin": {
+            "state": origin["state"],
+            "district": origin["district"],
+            "lat": origin["lat"],
+            "lng": origin["lng"],
+            "bbox_ne_lat": origin["bbox_ne_lat"],
+            "bbox_ne_lng": origin["bbox_ne_lng"],
+            "bbox_sw_lat": origin["bbox_sw_lat"],
+            "bbox_sw_lng": origin["bbox_sw_lng"],
+            "formatted_address": origin["formatted_address"],
+        },
+        "min_km": min_km,
+        "max_km": max_km,
+        "total": len(destinations),
+        "destinations": destinations,
+        "notes": {
+            "distance_method": "haversine (straight-line)",
+            "road_multiplier": ROAD_KM_MULTIPLIER,
+            "approximation": "estimated_road_km = distance_km × multiplier; actual road may differ by ±30%",
+        },
+    }
+
+
+@app.get("/api/lanes/from-district/export")
+def lanes_from_district_export(
+    state: str = Query(...),
+    district: str = Query(...),
+    min_km: float = Query(150, ge=0, le=5000),
+    max_km: float = Query(800, gt=0, le=5000),
+):
+    """
+    XLSX download of the lane list — single sheet, district-level only.
+    Columns: # | State | District | Min km | Distance (km) | Est. Road (km)
+    """
+    if min_km > max_km:
+        raise HTTPException(400, f"min_km ({min_km}) must be <= max_km ({max_km})")
+
+    origin, destinations = _compute_destinations(state, district, min_km, max_km)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Lanes"
+
+    # Title rows
+    ws["A1"] = f"Lanes from {origin['district']}, {origin['state']}"
+    ws["A1"].font = openpyxl.styles.Font(bold=True, size=14)
+    ws.merge_cells("A1:F1")
+
+    ws["A2"] = (f"Between {int(min_km)} and {int(max_km)} km straight-line · "
+                f"{len(destinations)} destinations · "
+                f"road km estimated as straight-line × {ROAD_KM_MULTIPLIER}")
+    ws["A2"].font = openpyxl.styles.Font(italic=True, color="666666")
+    ws.merge_cells("A2:F2")
+
+    # Header row
+    headers = ["#", "State", "District", "Min km (filter)", "Distance (km)", "Est. Road (km)"]
+    for col_idx, h in enumerate(headers, start=1):
+        c = ws.cell(row=4, column=col_idx, value=h)
+        c.font = openpyxl.styles.Font(bold=True)
+        c.fill = openpyxl.styles.PatternFill("solid", fgColor="F3F4F6")
+
+    # Data rows
+    for i, d in enumerate(destinations, start=1):
+        ws.cell(row=4 + i, column=1, value=i)
+        ws.cell(row=4 + i, column=2, value=d["state"])
+        ws.cell(row=4 + i, column=3, value=d["district"])
+        ws.cell(row=4 + i, column=4, value=int(min_km))
+        ws.cell(row=4 + i, column=5, value=d["distance_km"])
+        ws.cell(row=4 + i, column=6, value=d["estimated_road_km"])
+
+    # Column widths
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 14
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_district = "".join(c if c.isalnum() else "_" for c in district)
+    filename = f"daak_lanes_from_{safe_district}_{ts}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/district/stats")
 def district_stats(state: str = Query(...), district: str = Query(...)):
     row = fetch_one("""
